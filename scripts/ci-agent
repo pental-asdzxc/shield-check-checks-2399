@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# Runs one agent job from a checked exchange answer, as root inside the job
+# container, and leaves nothing of it running.
+#
+# usage: ci-agent run <answer-file> <state-dir>
+#
+# <answer-file> is the server's answer, already checked by ci-job, mode 0600
+# under <state-dir> (root only). Nothing else of the job is read, apart from
+# CI_API when the answer routes git through the Worker (source.git_ticket).
+#
+# 1. Root writes the hand-off: {{dir}}, the answer's dir (one directory under
+#    /tmp, replaced if it exists; 0700, uid 2000) with each dir_files
+#    entry as a 0600 uid 2000 file, the plugin_files under {{plugin}} and the
+#    bundle under its own directory, both root-owned and only readable to
+#    uid 2000, so what was verified cannot be rewritten by the agent.
+# 2. The npm bundle is downloaded and its sha512 compared with
+#    bundle.integrity before a byte of it is unpacked.
+# 3. The review tree is a plain clone of source.sha at source.ref in cwd,
+#    pruned with the same sparse patterns as the server's review tree, then
+#    handed to uid 2000. The token travels in a 0600 git config file named by
+#    GIT_CONFIG_GLOBAL, never in argv, the environment or the remote URL, and
+#    is revoked once the fetch is over. cwd is <review root>/<pr>/<slug>.
+# 4. ONE ci-sandbox call (uid 2000, env -i plus the answer's env map) runs
+#    start, then prompt, then waits until no wait.process is left or
+#    wait.timeout_seconds pass. ceiling_seconds bounds steps 2 to 4 together.
+# 5. ci-sandbox --reap, then {{dir}}, which holds the credential, is removed.
+#
+# No Actions cache is read or saved here. What the daemon, tmux or the CLI
+# print goes to <state-dir>/agent-run.log, root's own commands to
+# <state-dir>/agent.log. stdout carries exactly one line, `ci: agent <word>`.
+#
+# Exits 0 when the daemon was gone inside wait.timeout_seconds (done); 10 when
+# wait.timeout_seconds or the ceiling cut the agent call (timeout); 11 when the
+# start or the prompt command was refused, 12 when the bundle download or its
+# integrity was refused or the ceiling ran out before the bundle was in place
+# (refused); 13 when the clone failed or the ceiling ran out before it was
+# done or before the agent could start, 1 on anything else, including a
+# process left after the reap (failed).
+set -euo pipefail
+
+agent_root=/run/ci-agent
+git_base=https://github.com
+review_root=/workspace/.reviews
+sandbox_uid=2000
+
+# The server's review tree: everything, minus the root .claude folder (its
+# rules and CLAUDE.md kept), the root .mcp.json and the CLI config folders of
+# a .claude at any depth. An excluded pattern ends in no slash, so a committed
+# symlink of that name is excluded too.
+sparse_patterns=(
+    '/*'
+    '!/.claude'
+    '/.claude/rules/'
+    '/.claude/CLAUDE.md'
+    '!/.mcp.json'
+    '!**/.claude/skills'
+    '!**/.claude/commands'
+    '!**/.claude/agents'
+    '!**/.claude/output-styles'
+)
+
+# Runs as uid 2000 inside the sandbox. The argv files and the process pattern
+# are read from the spec directory, so no command line of the call carries the
+# pattern the wait looks for. Exits 0 done, 3 wait timeout, 4 start refused,
+# 5 prompt refused.
+agent_body="$(
+    cat <<'SH'
+set -u
+spec="$1"
+mapfile -d '' -t start <"$spec/start"
+mapfile -d '' -t prompt <"$spec/prompt"
+process="$(cat "$spec/process")"
+limit="$(cat "$spec/timeout")"
+"${start[@]}" || exit 4
+"${prompt[@]}" || exit 5
+end=$((SECONDS + limit))
+while pgrep -u "$(id -u)" -f -- "$process" >/dev/null; do
+    if [ "$SECONDS" -ge "$end" ]; then
+        exit 3
+    fi
+    sleep 1
+done
+exit 0
+SH
+)"
+
+# Replaces the only three placeholders in a string.
+jq_resolve='def resolve:
+    gsub("\\{\\{dir\\}\\}"; $dir) | gsub("\\{\\{plugin\\}\\}"; $plugin) | gsub("\\{\\{cwd\\}\\}"; $cwd);'
+
+usage() {
+    echo 'usage: ci-agent run <answer-file> <state-dir>' >&2
+    exit 2
+}
+
+# usage: agent_finish <code>
+# Reaps, removes the credential and prints the one public line. A process
+# left after the reap turns any result into failed.
+agent_finish() {
+    local code="$1"
+    local word
+
+    trap - EXIT
+    if ! ci-sandbox --reap; then
+        code=1
+    fi
+    rm -rf "$handoff_dir" "$state/agent-git.config" "$state/agent-revoke.curl" "$state/agent-bundle.tgz"
+
+    case "$code" in
+        0) word='done' ;;
+        10) word=timeout ;;
+        11 | 12) word=refused ;;
+        *) word=failed ;;
+    esac
+
+    printf 'ci: agent %s\n' "$word" >&3
+    exit "$code"
+}
+
+# usage: budget <code>
+# Sets `left` to the seconds before the ceiling, and ends the run with <code>
+# when none are. Only a call the ceiling cut while the agent ran ends as 10, a
+# timeout the server never retries; a ceiling spent before the agent could
+# start ends as the step's own failure (12 the bundle, 13 the clone or the
+# start), so the review runs again elsewhere.
+budget() {
+    left=$((deadline - $(date +%s)))
+    if [ "$left" -le 0 ]; then
+        agent_finish "$1"
+    fi
+}
+
+# usage: answer_field <jq-filter>   one raw value of the answer
+answer_field() {
+    jq -r "$1" "$answer"
+}
+
+write_handoff() {
+    local count
+    local index
+    local name
+    local path
+
+    rm -rf "$agent_root" "$handoff_dir"
+    install -d -m 0711 "$agent_root"
+    install -d -m 0700 "$handoff_dir"
+    install -d -m 0755 "$plugin_dir" "$spec_dir" "$bundle_dir"
+
+    # 1. The credential files. The directory goes to uid 2000 last, so the
+    #    agent never sees it half written.
+    count="$(answer_field '.dir_files | length')"
+    for ((index = 0; index < count; index++)); do
+        name="$(jq -r --argjson i "$index" '.dir_files[$i].name' "$answer")"
+        jq -j --argjson i "$index" '.dir_files[$i].content' "$answer" >"$handoff_dir/$name"
+        chmod 0600 "$handoff_dir/$name"
+        chown "$sandbox_uid:$sandbox_uid" "$handoff_dir/$name"
+    done
+    chown "$sandbox_uid:$sandbox_uid" "$handoff_dir"
+
+    # 2. The plugin stays root's: the agent reads it and cannot change it.
+    count="$(answer_field '.plugin_files | length')"
+    for ((index = 0; index < count; index++)); do
+        path="$plugin_dir/$(jq -r --argjson i "$index" '.plugin_files[$i].path' "$answer")"
+        (umask 022 && mkdir -p "${path%/*}")
+        jq -j --argjson i "$index" '.plugin_files[$i].content' "$answer" >"$path"
+        chmod 0644 "$path"
+    done
+
+    # 3. What the sandboxed body reads: NUL separated argv with the
+    #    placeholders resolved, the process to wait for and its limit.
+    resolved_jq --arg entry "$bundle_dir/$(answer_field '.bundle.entry')" \
+        '(.runtime + [$entry] + .start)[] | resolve' >"$spec_dir/start"
+    resolved_jq --arg entry "$bundle_dir/$(answer_field '.bundle.entry')" \
+        '(.runtime + [$entry] + .prompt)[] | resolve' >"$spec_dir/prompt"
+    resolved_jq '.env | to_entries[] | "\(.key)=\(.value | tostring | resolve)"' >"$spec_dir/env"
+    jq -j '.wait.process' "$answer" >"$spec_dir/process"
+    jq -j '.wait.timeout_seconds' "$answer" >"$spec_dir/timeout"
+    chmod 0644 "$spec_dir"/*
+}
+
+# usage: resolved_jq [jq-arg ...] <filter>   NUL separated strings of the answer, placeholders resolved
+resolved_jq() {
+    local filter="${*: -1}"
+
+    jq --raw-output0 \
+        --arg dir "$handoff_dir" \
+        --arg plugin "$plugin_dir" \
+        --arg cwd "$cwd" \
+        "${@:1:$#-1}" \
+        "$jq_resolve $filter" \
+        "$answer"
+}
+
+fetch_bundle() {
+    local integrity
+    local expected
+    local actual
+
+    budget 12
+    if ! curl --fail --silent --show-error --location --max-time "$left" \
+        -o "$state/agent-bundle.tgz" "$(answer_field '.bundle.url')"; then
+        agent_finish 12
+    fi
+
+    # npm's integrity is the base64 of the binary digest; both sides are
+    # compared as hex.
+    integrity="$(answer_field '.bundle.integrity')"
+    if ! expected="$(printf '%s' "${integrity#sha512-}" | base64 -d | od -An -v -tx1 | tr -d ' \n')" \
+        || [ "$integrity" = "${integrity#sha512-}" ] \
+        || [ "${#expected}" -ne 128 ]; then
+        agent_finish 12
+    fi
+    actual="$(sha512sum <"$state/agent-bundle.tgz")"
+    if [ "${actual%% *}" != "$expected" ]; then
+        echo 'ci-agent: the bundle does not match its integrity'
+        agent_finish 12
+    fi
+
+    if ! (umask 022 && tar -xzf "$state/agent-bundle.tgz" -C "$bundle_dir" --no-same-owner) \
+        || ! [ -f "$bundle_dir/$(answer_field '.bundle.entry')" ]; then
+        agent_finish 12
+    fi
+    rm -f "$state/agent-bundle.tgz"
+}
+
+# The URL and the headers are written by printf, a builtin, so neither the
+# repository name nor the token becomes an argument of a command.
+write_git_access() {
+    local ticket
+    local basic
+
+    ticket="$(answer_field '.source.git_ticket // empty')"
+    basic="$({
+        printf 'x-access-token:'
+        jq -j '.source.token' "$answer"
+    } | base64 | tr -d '\n')"
+
+    if [ -n "$ticket" ]; then
+        printf '[remote "origin"]\n\turl = %s/git\n' "${CI_API%/}" >>"$cwd/.git/config"
+    else
+        printf '[remote "origin"]\n\turl = %s/%s.git\n' "$git_base" "$(answer_field '.source.repo')" \
+            >>"$cwd/.git/config"
+    fi
+
+    {
+        printf '[http]\n'
+        printf '\textraHeader = Authorization: Basic %s\n' "$basic"
+        if [ -n "$ticket" ]; then
+            printf '\textraHeader = X-Ci-Ticket: %s\n' "$ticket"
+        fi
+    } >"$state/agent-git.config"
+}
+
+# Only the fetch needs the source token, so it is revoked as soon as the fetch
+# is over, the way the run roles revoke theirs: through the Worker's /gh-token
+# with the ticket header when a git ticket is set, else at GitHub. The bearer
+# goes to ci-post in a 0600 curl config, never in argv, and only a token and a
+# ticket that cannot break out of a quoted header line are written into it. A
+# 401 means the token already stopped working. A failure is only logged: the
+# token expires by itself and the review can still run.
+revoke_source_token() {
+    local url=https://api.github.com/installation/token
+    local config="$state/agent-revoke.curl"
+    local response="$state/agent-revoke.json"
+    local status=none
+
+    if [ -n "$(answer_field '.source.git_ticket // empty')" ]; then
+        url="${CI_API%/}/gh-token"
+    fi
+
+    if ! jq -er '
+        def header_safe: type == "string" and test("\\A[A-Za-z0-9._-]+\\z");
+        .source
+        | select((.token | header_safe) and (.git_ticket == null or (.git_ticket | header_safe)))
+        | "header = \"Authorization: Bearer \(.token)\"",
+            "header = \"Accept: application/vnd.github+json\"",
+            "header = \"X-GitHub-Api-Version: 2022-11-28\"",
+            (.git_ticket // empty | "header = \"X-Ci-Ticket: \(.)\"")
+    ' "$answer" >"$config"; then
+        rm -f "$config"
+        echo 'ci-agent: the source token was not revoked, it does not fit a header'
+        return 0
+    fi
+
+    # The status file is the verdict, so ci-post's own exit status adds nothing.
+    CI_POST_SINGLE_TRY_SECONDS=20 ci-post -X DELETE "$url" "$config" "$response" || true
+    if [ -f "$response.status" ]; then
+        status="$(<"$response.status")"
+    fi
+    rm -f "$config" "$response" "$response.status"
+
+    case "$status" in
+        2?? | 401) ;;
+        *) echo "ci-agent: the source token revocation failed (HTTP $status)" ;;
+    esac
+}
+
+clone_review_tree() {
+    local ref
+    local sha
+    local fetched=true
+
+    ref="$(answer_field '.source.ref')"
+    sha="$(answer_field '.source.sha')"
+
+    # 1. Root owns the tree while it is built, so git never runs as root in a
+    #    directory another account owns.
+    (umask 022 && mkdir -p "${cwd%/*}")
+    install -d -m 0755 "$cwd"
+    git init --quiet "$cwd" || agent_finish 13
+    write_git_access
+
+    # 2. The pinned commit, stored under the pull request ref. The token is
+    #    revoked whether or not the fetch worked, before anything can end the run.
+    budget 13
+    if ! GIT_CONFIG_GLOBAL="$state/agent-git.config" GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+        timeout --kill-after=15 "$left" \
+        git -C "$cwd" -c credential.helper= fetch --quiet --no-tags --depth=1 origin "+$sha:$ref"; then
+        fetched=false
+    fi
+    rm -f "$state/agent-git.config"
+    revoke_source_token
+    if [ "$fetched" = false ]; then
+        agent_finish 13
+    fi
+
+    # 3. The prune comes before the checkout, so no excluded file ever lands.
+    git -C "$cwd" sparse-checkout set --no-cone "${sparse_patterns[@]}" || agent_finish 13
+    git -C "$cwd" -c advice.detachedHead=false checkout --quiet --detach "$ref" || agent_finish 13
+
+    chown -R -h "$sandbox_uid:$sandbox_uid" "$cwd"
+}
+
+run_sandboxed() {
+    local pairs=()
+    local code=0
+
+    mapfile -d '' -t pairs <"$spec_dir/env"
+
+    # The agent has not started: a ceiling the setup spent is a pool-side failure, retried elsewhere.
+    budget 13
+    timeout --kill-after=15 "$left" \
+        ci-sandbox "$state/agent-run.log" "$cwd" "${pairs[@]}" -- bash -c "$agent_body" agent-body "$spec_dir" \
+        || code=$?
+
+    # 124 and 137: timeout cut the call at the ceiling.
+    case "$code" in
+        0) agent_finish 0 ;;
+        3 | 124 | 137) agent_finish 10 ;;
+        4 | 5) agent_finish 11 ;;
+        *) agent_finish 1 ;;
+    esac
+}
+
+# usage: agent_run <answer-file> <state-dir>
+agent_run() {
+    answer="$1"
+    state="$2"
+    plugin_dir="$agent_root/plugin"
+    spec_dir="$agent_root/spec"
+    bundle_dir="$agent_root/bundle"
+
+    umask 077
+    exec 3>&1
+    exec >>"$state/agent.log" 2>&1
+
+    # The server names the hand-off dir, and root removes it below. It is checked before the exit trap exists,
+    # because agent_finish removes it too and must never see a path that failed the check.
+    handoff_dir="$(answer_field '.dir')"
+    if ! [[ "$handoff_dir" =~ ^/tmp/[A-Za-z0-9._-]+$ ]] \
+        || [ "$handoff_dir" = /tmp/. ] || [ "$handoff_dir" = /tmp/.. ]; then
+        echo 'ci-agent: the hand-off dir is not one directory under /tmp'
+        printf 'ci: agent failed\n' >&3
+        exit 1
+    fi
+
+    # Root creates, inits and chowns cwd, so it is <review root>/<pr>/<slug> and nothing else, checked the same way.
+    cwd="$(answer_field '.cwd')"
+    local review="${cwd#"$review_root"/}"
+    if [ "$review" = "$cwd" ] || ! [[ "$review" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] \
+        || [[ "/$review/" =~ /\.\.?/ ]]; then
+        echo 'ci-agent: cwd is not one review directory'
+        printf 'ci: agent failed\n' >&3
+        exit 1
+    fi
+
+    trap 'agent_finish 1' EXIT
+
+    deadline=$(($(date +%s) + $(answer_field '.ceiling_seconds')))
+
+    write_handoff
+    fetch_bundle
+    clone_review_tree
+    run_sandboxed
+}
+
+main() {
+    # Root resolves every command from root-owned directories only, as ci-job does.
+    export PATH=/opt/ci:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+    if [ "$#" -ne 3 ] || [ "$1" != run ]; then
+        usage
+    fi
+
+    agent_run "$2" "$3"
+}
+
+# Sourced by scripts/test/ci-agent.test.sh; run otherwise.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi

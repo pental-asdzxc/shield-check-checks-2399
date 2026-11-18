@@ -83,6 +83,19 @@
 # of the step logs, at most 32768 bytes. A build never holds a secret beyond
 # its source token and its ticket.
 #
+# A job named `task` runs one agent. prepare trades the OIDC token for the
+# agent answer (retrying while the server answers 503, stopping at a 409),
+# checks its shape, moves it into a 0600 file under /ci/state/agent and names a
+# cache nothing else can seed. run hands that file to ci-agent, which does the
+# whole run as root and leaves nothing behind; its exit code becomes the
+# status (0 passed, 10 errored, every other code failed), every uid 2000
+# process is killed, and only then {ci_run_id, status, duration_s} is posted.
+# errored means the run ran out of time or was cut by a signal or a cancel, and
+# the server does not retry it; failed covers every other end, an answer that
+# never arrived or was refused, a bundle or clone failure, an internal error,
+# and the server retries the review on Docker. Nothing of the answer, its files
+# or ci-agent's output reaches the public log.
+#
 # Exits 0 once the server accepted the results, whatever their status, so the
 # public run carries no verdict on private code; 1 when they were not
 # delivered or prepare failed.
@@ -119,6 +132,10 @@ CI_JOB_CEILING_SECONDS="${CI_JOB_CEILING_SECONDS:-1020}"
 # a moment after the job can start, and every second waited is a build second.
 CI_BUILD_CEILING_SECONDS="${CI_BUILD_CEILING_SECONDS:-1020}"
 CI_BUILD_WAIT_SECONDS="${CI_BUILD_WAIT_SECONDS:-240}"
+# An agent's exchange waits this long for a server that answers 503: the server
+# abandons a row the job has not started within its own 150 s, after which the
+# answer is a final 409.
+CI_AGENT_WAIT_SECONDS="${CI_AGENT_WAIT_SECONDS:-150}"
 # How long report waits for ci-live's last flush before it kills the uploader.
 CI_LIVE_STOP_SECONDS="${CI_LIVE_STOP_SECONDS:-15}"
 api="${CI_API:-}"
@@ -159,7 +176,13 @@ building=false
 build_started=false
 build_outcome=''
 build_note=''
-# The token door's last answer to a deploy or a build: its HTTP status and the server's error code.
+# An agent job: `agent_job` is the job's name, `agent_started` is true once the
+# server moved its row to Running (the answer arrived, or an earlier one for it
+# was lost), which is when a result can be posted.
+agent_job=false
+agent_started=false
+agent_outcome=''
+# The token door's last answer to a deploy, a build or an agent: its HTTP status and the server's error code.
 exchange_code=''
 exchange_reason=''
 # What the last sandboxed call under a job deadline did: the step's exit code,
@@ -1278,6 +1301,16 @@ on_error() {
         if [ "$build_started" = true ]; then
             build_note="internal error at line $1"
             abandon_build
+        fi
+
+        exit 1
+    fi
+
+    # An agent's source token is ci-agent's to use, never this script's to revoke; a Running row is closed as failed
+    # (the review never completed, so the server retries it on Docker).
+    if [ "$agent_job" = true ]; then
+        if [ "$agent_started" = true ]; then
+            report_agent failed
         fi
 
         exit 1
@@ -3137,6 +3170,202 @@ run_deploy() {
     report_deploy "$result"
 }
 
+# ---------------------------------------------------------------------------
+# agent
+# ---------------------------------------------------------------------------
+
+# Trades the job's OIDC token for the agent answer and leaves it in $secret/token.json. Sets agent_outcome: started,
+# used (the row is Running but its answer never reached this job) or refused; agent_started is true for the first
+# two. The server's 409 is final.
+exchange_agent() {
+    agent_outcome=refused
+    jq -n --arg id "$CI_RUN_ID" '{ci_run_id: $id}' >"$state/token-request.json"
+
+    ask_token_door agent answer "$CI_AGENT_WAIT_SECONDS"
+
+    case "$exchange_code" in
+        2??)
+            agent_started=true
+            agent_outcome=started
+            ;;
+        409)
+            if [ "$exchange_reason" = already_used ]; then
+                agent_started=true
+                agent_outcome=used
+            else
+                say "agent: refused (${exchange_reason:-HTTP 409})"
+            fi
+            ;;
+    esac
+}
+
+# Checks the shape of the agent answer before any of it is kept, with jq's \A and \z (^ and $ match per line): the
+# working directory is /workspace/.reviews/<pr>/<slug> (root creates and chowns it), the hand-off dir is one segment
+# under /tmp, a file name one segment, none of them `.` or `..`; a plugin path is what the server's plugin writer
+# takes, any relative path without an empty, `.` or `..` segment, a control character or a backslash; the bundle
+# names a sha512 integrity; start and prompt are argument lists; the source is a plain owner/repo, a token, a
+# pull request ref, a 40 hex sha and a git ticket or null, since the repository, ticket and ref reach a git config
+# root reads and a newline there would start a new key. Everything else is ci-agent's to read. Prints the names of
+# the fields that fail.
+agent_answer_problems() {
+    jq -r '
+        def text(pattern): type == "string" and test(pattern);
+        def segment: text("\\A[A-Za-z0-9._-]+\\z") and . != "." and . != "..";
+        def plugin_path: type == "string" and length >= 1 and length <= 1024 and (test("[[:cntrl:]\\\\]") | not)
+            and (split("/") | all(. != "" and . != "." and . != ".."));
+        def argv: type == "array" and length >= 1 and all(.[]; type == "string");
+        def files(check): type == "array" and all(.[]; type == "object" and check and (.content | type == "string"));
+        def source_ok: type == "object"
+            and (.repo | text("\\A[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\\z") and (split("/") | all(. != "." and . != "..")))
+            and (.token | text("\\A[A-Za-z0-9._-]+\\z"))
+            and (.ref | text("\\Arefs/pull/[0-9]+/head\\z"))
+            and (.sha | text("\\A[0-9a-f]{40}\\z"))
+            and (.git_ticket == null or (.git_ticket | text("\\Av1\\.[A-Za-z0-9_-]+\\.[0-9a-f]{64}\\z")));
+        if type != "object" or (.bundle | type) != "object" then "answer"
+        else
+            [
+                (if .kind == "agent" then empty else "kind" end),
+                (if (.source | source_ok) then empty else "source" end),
+                (if (.cwd | text("\\A/workspace/\\.reviews/") and (.[20:] | split("/") | length == 2 and all(segment)))
+                    then empty else "cwd" end),
+                (if (.dir | text("\\A/tmp/") and (.[5:] | segment)) then empty else "dir" end),
+                (if (.bundle.integrity | text("\\Asha512-[A-Za-z0-9+/]+={0,2}\\z")) then empty else "integrity" end),
+                (if (.start | argv) then empty else "start" end),
+                (if (.prompt | argv) then empty else "prompt" end),
+                (if (.dir_files | files(.name | segment)) then empty else "dir_files" end),
+                (if (.plugin_files | files(.path | plugin_path)) then empty else "plugin_files" end)
+            ] | join(",")
+        end
+    ' "$secret/token.json"
+}
+
+# usage: report_agent <status>   posts {ci_run_id, status, duration_s}; exits 1 when it was not delivered
+report_agent() {
+    reporting=true
+    rm -f "$secret/token.json" "$secret/token.json.status" "$state/agent/answer.json"
+
+    # 1. Nothing the agent started may be alive once the results token exists.
+    if ! ci-sandbox --reap; then
+        rm -rf "$state/agent"
+        say 'uid 2000 processes survived; results not sent'
+        exit 1
+    fi
+
+    # 2. What ci-agent left (the hand-off files carry the credential) goes before the token is minted.
+    rm -rf "$state/agent"
+
+    jq -n --arg id "$CI_RUN_ID" --arg status "$1" --argjson duration "$SECONDS" \
+        '{ci_run_id: $id, status: $status, duration_s: $duration}' >"$state/results.json"
+    oidc_config "$results_audience" "$secret/results.curl"
+
+    if ! ci-post "$api/api/ci/results" "$secret/results.curl" "$state/results-response.json" "$state/results.json"; then
+        rm -f "$secret/results.curl"
+        say "results rejected (HTTP $(http_status "$state/results-response.json"))"
+        exit 1
+    fi
+
+    rm -f "$secret/results.curl"
+    say 'results sent'
+}
+
+# usage: stop_agent <exit-status>
+# A signal ends the job: a Running row is closed as errored, after report_agent's own reap.
+stop_agent() {
+    trap - TERM INT HUP
+    say 'agent: stopped by a signal'
+
+    if [ "$reporting" = false ]; then
+        report_agent errored
+    fi
+
+    exit "$1"
+}
+
+prepare_agent() {
+    local problems
+    local nonce
+
+    say 'prepare'
+
+    # 1. Nothing may be running as uid 2000 while the answer exists.
+    ci-sandbox --reap
+
+    # 2. The answer, or the reason there is none. A row that started without this job seeing its answer is closed.
+    exchange_agent
+    case "$agent_outcome" in
+        started) ;;
+        used)
+            say 'agent: the token was issued but its answer never arrived'
+            report_agent failed
+            exit 1
+            ;;
+        *)
+            rm -f "$secret/token.json" "$secret/token.json.status"
+            exit 1
+            ;;
+    esac
+
+    # 3. The answer's shape before any of it is kept; only field names reach the public log.
+    problems="$(agent_answer_problems)"
+    if [ -n "$problems" ]; then
+        say "agent: the answer has an unexpected shape ($problems)"
+        report_agent failed
+        exit 1
+    fi
+
+    # 4. run, a later step, hands ci-agent the answer as a root-only file under the directory ci-agent owns.
+    install -d -m 0700 "$state/agent"
+    mv -- "$secret/token.json" "$state/agent/answer.json"
+    chmod 0600 "$state/agent/answer.json"
+    rm -f "$secret/token.json.status"
+
+    # 5. A cache key random per job, so no cache another job seeded is restored here. Nothing is ever saved (the
+    #    matrix says save: false).
+    nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    printf '::add-mask::%s\n' "$nonce" >&3
+    printf 'cache_key=agent-%s\ncache_scope=agent\nmode=main\n' "$nonce" >>"${GITHUB_OUTPUT:?}"
+    say 'prepared'
+}
+
+# Hands the prepared answer to ci-agent, which does the whole run as root and reaps behind itself, and posts the
+# status its exit code names. ci-agent's output goes to the root-only log, and fd 3, the public log, is closed for it.
+run_agent() {
+    local answer="$state/agent/answer.json"
+    local code=0
+    local result
+
+    say 'run'
+    agent_started=true
+
+    if [ ! -f "$answer" ]; then
+        say 'prepare has not run in this container'
+        report_agent failed
+        exit 1
+    fi
+
+    # 1. A cancel closes the row as errored too, reaped first.
+    trap 'stop_agent 143' TERM
+    trap 'stop_agent 130' INT
+    trap 'stop_agent 129' HUP
+
+    # 2. The whole agent run; ci-agent enforces the answer's ceiling itself.
+    say 'agent: running'
+    ci-agent run "$answer" "$state/agent" 3>&- || code=$?
+
+    # 3. ci-agent exits 0 when the daemon exited 0 in time, 10 out of time or killed, 11 when start or prompt was
+    #    refused, 12 on a refused bundle and 13 on a failed clone. Only 10 is errored: the server reads errored as
+    #    "the review ran out of time, do not retry", and any other end, whatever kept the agent from running,
+    #    is failed so the review starts again on Docker.
+    case "$code" in
+        0) result=passed ;;
+        10) result=errored ;;
+        *) result=failed ;;
+    esac
+
+    say "agent: finished, $result"
+    report_agent "$result"
+}
+
 main() {
     # Root resolves every command from root-owned directories only: the
     # image's tool directories (the Flutter SDK among them) are uid 2000's
@@ -3193,6 +3422,9 @@ main() {
     elif [ "$CI_JOB_NAME" = build ]; then
         building=true
         "${phase}_build"
+    elif [ "$CI_JOB_NAME" = task ]; then
+        agent_job=true
+        "${phase}_agent"
     else
         "$phase"
     fi
