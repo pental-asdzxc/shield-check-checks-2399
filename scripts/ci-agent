@@ -303,7 +303,9 @@ revoke_source_token() {
 clone_review_tree() {
     local ref
     local sha
-    local fetched=true
+    local fetched
+    local try
+    local pause="${CI_FETCH_BACKOFF_SECONDS:-5}"
 
     ref="$(answer_field '.source.ref')"
     sha="$(answer_field '.source.sha')"
@@ -315,14 +317,28 @@ clone_review_tree() {
     git init --quiet "$cwd" || agent_finish 13
     write_git_access
 
-    # 2. The pinned commit, stored under the pull request ref. The token is
-    #    revoked whether or not the fetch worked, before anything can end the run.
+    # 2. The pinned commit, stored under the pull request ref. GitHub and the Worker's edge refuse a fetch now and
+    #    then (a 429 or a 5xx, which a run role's own fetch outlasts the same way), so it is tried up to four times,
+    #    pausing 5, 10 and 20 seconds, while the ceiling lasts. The token is revoked whether or not the fetch worked,
+    #    before anything can end the run, so a spent ceiling ends the tries, never the run, here.
     budget 13
-    if ! GIT_CONFIG_GLOBAL="$state/agent-git.config" GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
-        timeout --kill-after=15 "$left" \
-        git -C "$cwd" -c credential.helper= fetch --quiet --no-tags --depth=1 origin "+$sha:$ref"; then
-        fetched=false
-    fi
+    fetched=false
+    for try in 1 2 3 4; do
+        if GIT_CONFIG_GLOBAL="$state/agent-git.config" GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+            timeout --kill-after=15 "$left" \
+            git -C "$cwd" -c credential.helper= fetch --quiet --no-tags --depth=1 origin "+$sha:$ref"; then
+            fetched=true
+            break
+        fi
+        if [ "$try" -lt 4 ]; then
+            sleep "$pause"
+            pause=$((pause * 2))
+        fi
+        left=$((deadline - $(date +%s)))
+        if [ "$left" -le 0 ]; then
+            break
+        fi
+    done
     rm -f "$state/agent-git.config"
     revoke_source_token
     if [ "$fetched" = false ]; then
