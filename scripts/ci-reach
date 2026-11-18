@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# Joins the job's host to a private network for the length of one step and leaves it again, so a deploy step can
+# reach a box that has no public address.
+#
+# usage: ci-reach up <authkey-file> <dir>
+#        ci-reach down <dir>
+#
+# up    creates <dir> (mode 0700, it must not exist), MOVES <authkey-file> into it as <dir>/authkey (the caller's
+#       original is consumed, so `down` needs only the directory), starts tailscaled in userspace networking with
+#       its socket at <dir>/ts.sock, joins with the key read from that file, and returns once the node reports
+#       Running. Detail goes to <dir>/reach.log (0600) and the pid to <dir>/tailscaled.pid (0600); stdout stays
+#       empty and the daemon does not inherit the caller's fd 3.
+# down  logs out while the daemon still answers, stops the daemon, and shreds the key. It works from the directory
+#       alone, on an `up` that failed at any point, and a second time, so a caller can run it from an EXIT trap
+#       right after (or instead of waiting for) `up`.
+#
+# The daemon opens no SOCKS or HTTP proxy listener: anything that wants the tailnet must reach the socket, and the
+# socket sits in a root-only directory. --state=mem: (an ephemeral node with nothing on disk) and
+# --no-logs-no-support (no log upload) come from the tailscaled reference docs; the other flags were proven on the
+# pinned release by the probe workflow.
+#
+# Failure: one fixed line, `ci: tailnet join failed`, on stderr and exit 1. A usage error exits 2. Neither carries
+# the key, the node name or an address; those can only reach <dir>/reach.log.
+#
+# CI_REACH_WAIT_SECONDS bounds the wait for the Running state after the join returned (default 60).
+set -Eeuo pipefail
+
+usage() {
+    echo 'usage: ci-reach up <authkey-file> <dir>' >&2
+    echo '       ci-reach down <dir>' >&2
+    exit 2
+}
+
+fail_join() {
+    echo 'ci: tailnet join failed' >&2
+    exit 1
+}
+
+# The suffix keeps two jobs on one tailnet from colliding on a name.
+node_name() {
+    local suffix
+    suffix="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+    printf 'ci-node-%s' "$suffix"
+}
+
+# usage: wait_for_socket <socket>   bounded to 10 s; the daemon creates the socket a moment after it starts
+wait_for_socket() {
+    for _ in $(seq 1 50); do
+        [[ -S "$1" ]] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
+# usage: wait_for_running <socket> <seconds> <log>
+# `tailscale up` already blocks until the join finishes; this confirms the node is really Running before a caller
+# relies on it. A failed status call retries until the deadline because the daemon may still be settling.
+wait_for_running() {
+    local socket="$1" deadline=$((SECONDS + $2)) log="$3" backend=''
+    while :; do
+        backend="$(tailscale --socket="$socket" status --json 2>>"$log" | jq -r '.BackendState // empty' 2>>"$log")" \
+            || backend=''
+        [[ "$backend" == Running ]] && return 0
+        ((SECONDS < deadline)) || return 1
+        sleep 0.5
+    done
+}
+
+reach_up() {
+    local key_file="$1" dir="$2"
+    local wait_seconds="${CI_REACH_WAIT_SECONDS:-60}"
+    local socket="$dir/ts.sock" log="$dir/reach.log"
+
+    [[ -s "$key_file" && "$wait_seconds" =~ ^[0-9]+$ ]] || fail_join
+    umask 077
+
+    # 1. A directory up made itself, so its mode and owner are not someone else's to have changed. The key moves
+    #    in before anything starts, so `down` can remove it however far up got.
+    #    mkdir speaks before the log exists, and its message names the path, so it is dropped.
+    mkdir -m 0700 -- "$dir" 2>/dev/null || fail_join
+    : >"$log"
+    mv -- "$key_file" "$dir/authkey" 2>>"$log" || fail_join
+    chmod 0600 "$dir/authkey"
+
+    # 2. The daemon outlives this script, so it gets none of the caller's descriptors: a public log on fd 3 must
+    #    not keep receiving what the daemon prints, and a pipe around this script must be able to close.
+    tailscaled --tun=userspace-networking --state=mem: --socket="$socket" --no-logs-no-support \
+        </dev/null >>"$log" 2>&1 3>&- &
+    printf '%s\n' "$!" >"$dir/tailscaled.pid"
+    wait_for_socket "$socket" || fail_join
+
+    # 3. The key is named as a file: a value on the command line would sit in /proc/<pid>/cmdline.
+    tailscale --socket="$socket" up --auth-key="file:$dir/authkey" --hostname="$(node_name)" \
+        --accept-routes=false --accept-dns=false --shields-up --timeout=60s >>"$log" 2>&1 || fail_join
+    wait_for_running "$socket" "$wait_seconds" "$log" || fail_join
+}
+
+# usage: stop_daemon <pid-file>   TERM, a short grace, then KILL; a missing or stale pid is nothing to stop
+stop_daemon() {
+    local pid
+    [[ -f "$1" ]] || return 0
+    pid="$(<"$1")"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+
+    # The daemon may exit between the check and the signal; the key still has to be shredded after this.
+    kill "$pid" 2>/dev/null || return 0
+    for _ in $(seq 1 50); do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+}
+
+reach_down() {
+    local dir="$1"
+    local socket="$dir/ts.sock" log="$dir/reach.log"
+
+    [[ -d "$dir" ]] || return 0
+
+    # 1. Logout is best effort: an `up` that failed at the join has nothing to log out of, and the node is
+    #    ephemeral, so the tailnet drops it once the daemon is gone either way. The failure is kept in the log.
+    if [[ -S "$socket" ]]; then
+        timeout 20 tailscale --socket="$socket" logout >>"$log" 2>&1 || echo 'logout failed' >>"$log"
+    fi
+
+    # 2. The daemon goes before the key: nothing may reconnect with the key once it is on its way out.
+    stop_daemon "$dir/tailscaled.pid"
+    rm -f -- "$socket" "$dir/tailscaled.pid"
+
+    # 3. Shred where it can, remove regardless: a key left behind is the one outcome that must not happen.
+    if [[ -e "$dir/authkey" ]]; then
+        shred -u -- "$dir/authkey" 2>>"$log" || rm -f -- "$dir/authkey"
+    fi
+}
+
+case "${1:-}" in
+    up)
+        [[ $# -eq 3 ]] || usage
+        reach_up "$2" "$3"
+        ;;
+    down)
+        [[ $# -eq 2 ]] || usage
+        reach_down "$2"
+        ;;
+    *)
+        usage
+        ;;
+esac

@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# Streams a job's progress while it runs: the step events ci-job appends to
+# <state-dir>/live/events.ndjson and the sandboxed step logs, redacted. Runs as
+# root in the background of `ci-job run`, prints nothing (ci-job sends its
+# stdout and stderr to <state-dir>/live/uploader.out and closes fd 3 for it),
+# and after <state-dir>/live/stop appears makes one last flush, then leaves
+# <state-dir>/live/done.
+#
+# usage: ci-live <api> <state-dir> <secret-dir>
+#        ci-live --redact <redact-file>
+#
+# --redact        copies stdin to stdout with every non-empty line of
+#                 <redact-file> replaced by [redacted], line by line; the
+#                 uploaded logs go through the same filter.
+#
+# Events go to <api>/api/ci/events with the events ticket: the lines after
+# the last acknowledged seq, at most 100 per request. 200 acknowledges up to
+# last_seq, 409 resumes at expected_seq, 413 and 422 skip the batch, anything
+# else is tried again next round.
+#
+# The log is one stream of the logs <state-dir>/live/order names, in that
+# order, each under the `== <name> ==` heading the uploaded logs use: complete
+# lines only (a finished log's last line too), a line longer than 64 KiB left
+# out with a marker, since only a whole line can be redacted. Up to about
+# 64 KiB per chunk goes to <api>/api/ci/logs/chunk with the chunk ticket and
+# X-Ci-Offset set to the length the server last reported. The server counts
+# redacted bytes, which can differ from the bytes sent (its own redaction runs
+# too), so 200 always moves the offset to next_offset and drops the chunk: a
+# replay after a lost answer is a 200 that reports the length the server holds.
+# 409 with an expected_offset means the server holds less than it acknowledged,
+# which cannot be repaired from here, so the stream ends; 409 without one (a
+# racing writer) and a 200 without next_offset are tried again; 413 (the job's
+# log budget) and 422 end the stream.
+#
+# Every request is a single try of at most 10 s; a round runs every
+# CI_LIVE_INTERVAL_SECONDS (default 2) and sends up to 8 chunks while the
+# server keeps answering. No errexit: a step that fails waits for the next
+# round, and ci-job kills this process when its time is up.
+set -u
+
+usage() {
+    echo 'usage: ci-live <api> <state-dir> <secret-dir>' >&2
+    echo '       ci-live --redact <redact-file>' >&2
+    exit 2
+}
+
+redact() {
+    php -r '
+        $secrets = array_values(array_filter(array_map("trim", file($argv[1]))));
+        while (($line = fgets(STDIN)) !== false) {
+            echo str_replace($secrets, "[redacted]", $line);
+        }
+    ' -- "$1"
+}
+
+if [ "${1:-}" = --redact ]; then
+    [ $# -eq 2 ] || usage
+    redact "$2"
+    exit
+fi
+
+[ $# -eq 3 ] || usage
+
+api="$1"
+state="$2"
+secret="$3"
+live="$state/live"
+interval="${CI_LIVE_INTERVAL_SECONDS:-2}"
+events_file="$live/events.ndjson"
+events_config="$secret/live-events.curl"
+chunk_config="$secret/live-chunk.curl"
+raw="$live/chunk.raw"
+pending="$live/chunk.txt"
+acked=0
+offset=0
+chunks=true
+
+export CI_POST_SINGLE_TRY_SECONDS=10
+trap '' PIPE
+trap 'rm -f "$events_config" "$chunk_config"; : >"$live/done"' EXIT
+umask 077
+
+# usage: write_config <ticket-file> <config-file>   the ticket as a bearer, never an argument
+write_config() {
+    local ticket
+
+    ticket="$(cat "$1")" || return 1
+    printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/json"\n' "$ticket" >"$2"
+}
+
+# Prints the next complete lines of the step logs, at most about 64 KiB, and
+# moves the cursor in <live>/cursor.json past them. Only lines of the order
+# file that end in a newline count: ci-job may be writing the next one. Once
+# <live>/stop exists every step has ended, so the last log counts as finished.
+next_lines() {
+    local final=0
+
+    if [ -e "$live/stop" ]; then
+        final=1
+    fi
+
+    php -- "$live/order" "$state" "$live/cursor.json" "$final" <<'PHP'
+<?php
+
+[, $orderFile, $logDir, $cursorFile, $final] = $argv;
+$window = 65536;
+
+$names = explode("\n", (string) @file_get_contents($orderFile));
+array_pop($names);
+
+$cursor = json_decode((string) @file_get_contents($cursorFile), true);
+if (! is_array($cursor)) {
+    $cursor = ['entry' => 0, 'pos' => null, 'skipping' => false, 'ends' => []];
+}
+
+$out = '';
+
+while ($cursor['entry'] < count($names) && strlen($out) < $window) {
+    $name = $names[$cursor['entry']];
+    $log = "{$logDir}/{$name}.log";
+    // ci-job starts a step only after the one before it ended, so a log followed by another is complete.
+    $finished = $final === '1' || $cursor['entry'] + 1 < count($names);
+
+    // A log named again (the same step run twice) goes on where it stopped.
+    if ($cursor['pos'] === null) {
+        $out .= "== {$name} ==\n";
+        $cursor['pos'] = $cursor['ends'][$name] ?? 0;
+    }
+
+    clearstatcache();
+    $size = is_file($log) ? (int) filesize($log) : 0;
+    $data = $size > $cursor['pos']
+        ? (string) file_get_contents($log, false, null, $cursor['pos'], min($size - $cursor['pos'], $window))
+        : '';
+    $read = strlen($data);
+
+    if ($cursor['skipping']) {
+        $newline = strpos($data, "\n");
+        $cursor['pos'] += $newline === false ? $read : $newline + 1;
+        $cursor['skipping'] = $newline === false;
+
+        if ($read > 0) {
+            continue;
+        }
+    } elseif ($read > 0) {
+        $newline = strrpos($data, "\n");
+
+        if ($newline === false && $read === $window) {
+            $out .= "[a line longer than 64 KiB was left out]\n";
+            $cursor['pos'] += $read;
+            $cursor['skipping'] = true;
+
+            continue;
+        }
+
+        if ($newline === false && ! $finished) {
+            break;
+        }
+
+        $piece = $newline === false ? $data : substr($data, 0, $newline + 1);
+        $text = $newline === false ? $piece."\n" : $piece;
+
+        if ($out !== '' && strlen($out) + strlen($text) > $window) {
+            break;
+        }
+
+        $out .= $text;
+        $cursor['pos'] += strlen($piece);
+
+        continue;
+    }
+
+    if (! $finished) {
+        break;
+    }
+
+    $cursor['ends'][$name] = $cursor['pos'];
+    $cursor['entry']++;
+    $cursor['pos'] = null;
+    $cursor['skipping'] = false;
+}
+
+echo $out;
+file_put_contents("{$cursorFile}.tmp", json_encode($cursor, JSON_THROW_ON_ERROR));
+rename("{$cursorFile}.tmp", $cursorFile);
+PHP
+}
+
+# Returns 0 when a batch was answered, 1 when there was nothing to send or the
+# request failed.
+send_events() {
+    local body="$live/events.json"
+    local response="$live/events-response.json"
+    local total
+    local count
+    local value
+
+    total=$(($(wc -l <"$events_file")))
+    if [ "$total" -le "$acked" ]; then
+        return 1
+    fi
+
+    count=$((total - acked))
+    if [ "$count" -gt 100 ]; then
+        count=100
+    fi
+
+    # The Worker refuses a body over 256 KiB.
+    while :; do
+        sed -n "$((acked + 1)),$((acked + count))p" "$events_file" | jq -cs '{events: .}' >"$body" || return 1
+        if [ "$(wc -c <"$body")" -le 262144 ] || [ "$count" -eq 1 ]; then
+            break
+        fi
+        count=$((count / 2))
+    done
+
+    # A request that never gets an answer leaves no status file; a stale one would be read as this answer.
+    rm -f "$response.status"
+    ci-post "$api/api/ci/events" "$events_config" "$response" "$body"
+
+    case "$(cat "$response.status" 2>/dev/null)" in
+        2??)
+            value="$(jq -r '.last_seq | select(type == "number" and . >= 0) | floor' "$response" 2>/dev/null)"
+            acked="${value:-$((acked + count))}"
+            ;;
+        409)
+            value="$(jq -r '.expected_seq | select(type == "number" and . >= 1) | floor' "$response" 2>/dev/null)"
+            if [ -z "$value" ]; then
+                return 1
+            fi
+            acked=$((value - 1))
+            ;;
+        413 | 422)
+            acked=$((acked + count))
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Builds the pending chunk when there is none: the next lines, redacted. The
+# chunk stays pending until the server answers 200, so a lost answer sends the
+# same text again at the same offset.
+build_chunk() {
+    if [ ! -s "$raw" ]; then
+        next_lines >"$raw" || return 1
+    fi
+    if [ ! -s "$raw" ]; then
+        return 1
+    fi
+    redact "$secret/redact" <"$raw" >"$pending.tmp" || return 1
+    mv "$pending.tmp" "$pending" || return 1
+    rm -f "$raw"
+}
+
+# Returns 0 when the server answered (a 409 gap, a 413 or a 422 also end the
+# stream), 1 when there was nothing to send, no usable answer came or the
+# stream had already ended.
+send_chunk() {
+    local response="$live/chunk-response.json"
+    local value
+
+    if [ "$chunks" != true ]; then
+        return 1
+    fi
+    if [ ! -s "$pending" ]; then
+        build_chunk || return 1
+    fi
+
+    # A request that never gets an answer leaves no status file; a stale one would be read as this answer.
+    rm -f "$response.status"
+    ci-post -t "$offset" "$api/api/ci/logs/chunk" "$chunk_config" "$response" "$pending"
+
+    case "$(cat "$response.status" 2>/dev/null)" in
+        2??)
+            value="$(jq -r '.next_offset | select(type == "number" and . >= 0) | floor' "$response" 2>/dev/null)"
+            if [ -z "$value" ]; then
+                return 1
+            fi
+            offset="$value"
+            rm -f "$pending"
+            ;;
+        409)
+            value="$(jq -r '.expected_offset | select(type == "number" and . >= 0) | floor' "$response" 2>/dev/null)"
+            if [ -z "$value" ]; then
+                return 1
+            fi
+            # The server holds less than it acknowledged: the lost bytes are gone from here.
+            chunks=false
+            rm -f "$pending"
+            ;;
+        413 | 422)
+            chunks=false
+            rm -f "$pending"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+if ! write_config "$secret/live-events-ticket" "$events_config" \
+    || ! write_config "$secret/live-chunk-ticket" "$chunk_config"; then
+    exit 1
+fi
+
+while :; do
+    if [ -e "$live/stop" ]; then
+        # The last flush: everything that is left, while either door still
+        # makes progress; ci-job's deadline bounds it.
+        for _ in $(seq 1 500); do
+            progressed=false
+            if send_events; then
+                progressed=true
+            fi
+            if send_chunk; then
+                progressed=true
+            fi
+            if [ "$progressed" = false ]; then
+                break
+            fi
+        done
+        exit 0
+    fi
+
+    send_events
+    for _ in 1 2 3 4 5 6 7 8; do
+        send_chunk || break
+        # A slow door must not push the final flush past ci-job's bound: stop is looked at between chunks.
+        if [ -e "$live/stop" ]; then
+            break
+        fi
+    done
+    if [ ! -e "$live/stop" ]; then
+        sleep "$interval"
+    fi
+done

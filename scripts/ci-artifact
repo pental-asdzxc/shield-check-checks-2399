@@ -1,0 +1,455 @@
+#!/usr/bin/env bash
+# Packs a build's output into an archive and sends it to the artifact door;
+# on the deploy side, downloads that archive back and unpacks it.
+#
+# usage: ci-artifact pack <dir> <out.tar.gz>
+#        ci-artifact upload <file> <api> <ticket-file> <chunk-bytes>
+#        ci-artifact fetch <api> <ticket-file> <sha256> <size> <out>
+#        ci-artifact unpack <archive> <dir>
+#
+# pack     archives <dir> as gzip ustar, paths relative with a leading `./`,
+#          numeric owners, no gzip timestamp, and prints `<sha256> <size>` of
+#          the archive on stdout. Before tar runs it refuses an entry that is
+#          not a regular file or directory (tar would store a symlink, a fifo
+#          or a device as such), a file with more than one link, and a path
+#          longer than 100 bytes, a directory counted with its trailing slash
+#          (the ustar name field; tar drops a longer name with only a warning).
+#          A non-zero status or any stderr from tar or gzip fails it. The
+#          archive is written to <out>.part and renamed; on any failure
+#          neither <out> nor <out>.part is left, an older <out> included.
+# upload   sends <file> to <api>/api/ci/artifact/chunk in chunks of at most
+#          <chunk-bytes>, each with X-Ci-Offset, in offset order. A 409
+#          offset_gap or conflict resumes at its expected_offset (at most 3
+#          times in a row without a 200). Then <api>/api/ci/artifact/close
+#          gets `{"sha256", "size"}`. A close answered 409 not_uploading after
+#          a lost answer (ci-post exits 0) counts as sent: the first close
+#          landed, and the server checks its outcome again at the result.
+#          Prints nothing on stdout.
+# fetch    downloads <api>/api/ci/artifact into <out>.part with curl -C -,
+#          resuming after a cut connection, a 5xx or no answer, at most 6
+#          tries within 15 minutes; a resume answered with the whole file (200)
+#          restarts from zero. 404, 409 (artifact_mismatch) and 410
+#          (artifact_gone) are final, each with its own line. The file becomes
+#          <out> only when its size and sha256 equal <size> and <sha256> (the
+#          ledger's); otherwise neither <out> nor <out>.part is left, an older
+#          <out> included. CI_ARTIFACT_BACKOFF_SECONDS (default 5) is the
+#          pause between tries. Prints nothing on stdout.
+# unpack   extracts <archive> (GNU tar) into <dir>, which must not exist or be
+#          empty and is created anew with mode 0700, never taking owners or
+#          modes from the archive: afterwards files are 0600 and directories
+#          0700. Nothing in the archive is executed or interpreted. Anything
+#          other than a regular file or directory after extraction, or a
+#          failing tar, removes <dir>. tar's stderr, which can name archive
+#          paths, is dropped. Prints nothing on stdout.
+#
+# <ticket-file> holds the upload or download ticket. It reaches curl only
+# through a 0600 config file in a 0700 scratch directory, never argv, the
+# environment or a log. A ticket outside [A-Za-z0-9._~+/=-]{1,4096} is refused
+# before any request, since a quote or a newline would add lines to that
+# config.
+#
+# Failure: one fixed `ci: ...` line on stderr and exit 1; a usage error exits
+# 2. No line names a path, an offset, a digest, a host or the ticket. When
+# CI_STATE_DIR is set, the status of each request and the stderr of ci-post
+# and curl go to $CI_STATE_DIR/artifact.log (0600); otherwise they are dropped.
+set -Eeuo pipefail
+
+# Byte semantics for ${#path} and for tar's name handling.
+export LC_ALL=C
+umask 077
+
+readonly MAX_PATH_BYTES=100
+readonly MAX_RESUMES=3
+readonly MAX_FETCH_TRIES=6
+readonly FETCH_SECONDS=900
+
+scratch=''
+partial=''
+unpacked=''
+detail_log=/dev/null
+if [[ -n "${CI_STATE_DIR:-}" ]]; then
+    detail_log="$CI_STATE_DIR/artifact.log"
+fi
+
+usage() {
+    echo 'usage: ci-artifact pack <dir> <out.tar.gz>' >&2
+    echo '       ci-artifact upload <file> <api> <ticket-file> <chunk-bytes>' >&2
+    echo '       ci-artifact fetch <api> <ticket-file> <sha256> <size> <out>' >&2
+    echo '       ci-artifact unpack <archive> <dir>' >&2
+    exit 2
+}
+
+cleanup() {
+    if [[ -n "$scratch" ]]; then
+        rm -rf -- "$scratch"
+    fi
+    if [[ -n "$partial" ]]; then
+        rm -f -- "$partial"
+    fi
+    if [[ -n "$unpacked" ]]; then
+        rm -rf -- "$unpacked"
+    fi
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# usage: refuse <reason>   the fixed public line, then exit 1
+refuse() {
+    printf 'ci: %s\n' "$1" >&2
+    exit 1
+}
+
+note() {
+    printf '%s\n' "$1" >>"$detail_log"
+}
+
+file_size() {
+    local size
+
+    size="$(wc -c <"$1")"
+    printf '%s\n' "${size//[[:space:]]/}"
+}
+
+file_sha256() {
+    local digest
+
+    digest="$(sha256sum <"$1")"
+    printf '%s\n' "${digest%% *}"
+}
+
+# usage: find_any <dir> <unreadable-reason> <find-expression...>
+#   true when an entry below <dir> matches; refuses with <unreadable-reason> when find fails
+find_any() {
+    local dir="$1"
+    local unreadable="$2"
+    local hit
+
+    shift 2
+    # find's stderr would name the path it could not read.
+    if ! hit="$(find "$dir" -mindepth 1 "$@" -print -quit 2>/dev/null)"; then
+        refuse "$unreadable"
+    fi
+    [[ -n "$hit" ]]
+}
+
+# usage: check_path_lengths <dir> <type> <suffix>   refuses an archive name, `./<path><suffix>`, over the limit
+check_path_lengths() {
+    local list="$scratch/entries"
+    local path
+
+    if ! (cd -- "$1" && find . -mindepth 1 -type "$2" -print0) >"$list" 2>/dev/null; then
+        refuse 'the build output could not be read'
+    fi
+    while IFS= read -r -d '' path; do
+        if ((${#path} + ${#3} > MAX_PATH_BYTES)); then
+            refuse "the build output holds a path longer than $MAX_PATH_BYTES bytes"
+        fi
+    done <"$list"
+}
+
+pack() {
+    local dir="$1"
+    local out="$2"
+    local errors
+
+    # 1. Whatever this run fails at, no earlier archive may pass for its output.
+    rm -f -- "$out" "$out.part"
+    if [[ ! -d "$dir" || -L "$dir" ]]; then
+        refuse 'the build output is not a directory'
+    fi
+    scratch="$(mktemp -d)"
+    errors="$scratch/tar.err"
+
+    # 2. The tree must hold only what the door's validator and the deploy's unpack accept, checked before tar reads it.
+    if find_any "$dir" 'the build output could not be read' '!' -type f '!' -type d; then
+        refuse 'the build output holds an entry that is not a regular file or directory'
+    fi
+    if find_any "$dir" 'the build output could not be read' -type f -links +1; then
+        refuse 'the build output holds a file with more than one link'
+    fi
+    check_path_lengths "$dir" f ''
+    check_path_lengths "$dir" d /
+
+    # 3. tar's stderr can name archive paths, so it is only checked for being empty, never shown.
+    partial="$out.part"
+    if ! COPYFILE_DISABLE=1 tar -C "$dir" --format=ustar --numeric-owner -cf - . 2>"$errors" \
+        | gzip -n 2>>"$errors" >"$partial"; then
+        refuse 'packing the build output failed'
+    fi
+    if [[ -s "$errors" ]]; then
+        refuse 'packing the build output failed'
+    fi
+    mv -f -- "$partial" "$out" || refuse 'packing the build output failed'
+    partial=''
+
+    printf '%s %s\n' "$(file_sha256 "$out")" "$(file_size "$out")"
+}
+
+# usage: ticket_config <ticket-file>
+#   makes the 0700 scratch directory and writes the bearer to $scratch/ticket.curl (0600, by umask)
+ticket_config() {
+    local ticket
+
+    ticket="$(<"$1")"
+    # The length is checked apart: macOS regex caps a repetition count at 255.
+    if [[ ! "$ticket" =~ ^[A-Za-z0-9._~+/=-]+$ ]] || ((${#ticket} > 4096)); then
+        refuse 'the artifact ticket is malformed'
+    fi
+    scratch="$(mktemp -d)"
+    printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/json"\n' "$ticket" \
+        >"$scratch/ticket.curl"
+}
+
+# usage: json_value <file> <jq-filter>   prints the value, or nothing for a body that is not JSON
+json_value() {
+    jq -r "$2" "$1" 2>/dev/null || return 0
+}
+
+json_offset() {
+    json_value "$1" ".$2 | select(type == \"number\" and . >= 0 and . == floor)"
+}
+
+json_code() {
+    json_value "$1" '.error.code | select(type == "string")'
+}
+
+# usage: status_of <response-file>   the HTTP status ci-post recorded, or nothing when it recorded none
+status_of() {
+    if [[ -f "$1.status" ]]; then
+        printf '%s\n' "$(<"$1.status")"
+    fi
+}
+
+upload() {
+    local file="$1"
+    local api="$2"
+    local ticket_file="$3"
+    local chunk_bytes="$4"
+    local config response size digest offset=0 resumes=0
+    local pieces index skip chunk length code next posted
+
+    if [[ ! "$chunk_bytes" =~ ^[1-9][0-9]{0,17}$ || ! -f "$file" || ! -s "$file" || ! -r "$ticket_file" ]]; then
+        usage
+    fi
+
+    # 1. The ticket goes straight from its file into a 0600 config in a 0700 directory.
+    ticket_config "$ticket_file"
+    config="$scratch/ticket.curl"
+    response="$scratch/response.json"
+
+    # 2. Fixed pieces: a resume at any offset sends the tail of one piece, then whole pieces again.
+    size="$(file_size "$file")"
+    digest="$(file_sha256 "$file")"
+    split -a 8 -b "$chunk_bytes" "$file" "$scratch/piece." || refuse 'the artifact upload failed'
+    pieces=("$scratch"/piece.*)
+    if ((${#pieces[@]} != (size + chunk_bytes - 1) / chunk_bytes)); then
+        refuse 'the artifact upload failed'
+    fi
+
+    # 3. Chunks in offset order; the door's expected_offset is the only place a chunk may start after a 409.
+    while ((offset < size)); do
+        index=$((offset / chunk_bytes))
+        skip=$((offset % chunk_bytes))
+        chunk="${pieces[index]}"
+        if ((skip > 0)); then
+            tail -c "+$((skip + 1))" "$chunk" >"$scratch/resume" || refuse 'the artifact upload failed'
+            chunk="$scratch/resume"
+        fi
+        length="$(file_size "$chunk")"
+
+        # ci-post's exit status adds nothing here: a 409 resumes whether or not it followed a lost answer.
+        rm -f -- "$response" "$response.status"
+        posted=0
+        ci-post -o "$offset" "$api/api/ci/artifact/chunk" "$config" "$response" "$chunk" 2>>"$detail_log" || posted=$?
+        code="$(status_of "$response")"
+        note "chunk at $offset: status ${code:-none}, ci-post $posted"
+
+        case "$code" in
+            200)
+                next="$(json_offset "$response" offset)"
+                if [[ "$next" != "$((offset + length))" ]]; then
+                    refuse 'the artifact upload lost its place'
+                fi
+                offset="$next"
+                resumes=0
+                ;;
+            409)
+                case "$(json_code "$response")" in
+                    offset_gap | conflict) ;;
+                    not_uploading) refuse 'the artifact upload was closed by the server' ;;
+                    *) refuse 'the artifact upload failed' ;;
+                esac
+                next="$(json_offset "$response" expected_offset)"
+                if [[ -z "$next" ]] || ((next > size || resumes >= MAX_RESUMES)); then
+                    refuse 'the artifact upload lost its place'
+                fi
+                offset="$next"
+                resumes=$((resumes + 1))
+                ;;
+            401) refuse 'the artifact ticket was refused' ;;
+            413) refuse 'the artifact is larger than the server allows' ;;
+            422) refuse 'the server refused an artifact chunk' ;;
+            *) refuse 'the artifact upload failed' ;;
+        esac
+    done
+
+    # 4. The claim the door checks against what it stored, then freezes.
+    printf '{"sha256":"%s","size":%s}\n' "$digest" "$size" >"$scratch/close.json"
+    rm -f -- "$response" "$response.status"
+    posted=0
+    ci-post "$api/api/ci/artifact/close" "$config" "$response" "$scratch/close.json" 2>>"$detail_log" || posted=$?
+    code="$(status_of "$response")"
+    note "close: status ${code:-none}, ci-post $posted"
+
+    case "$code" in
+        200)
+            if [[ "$(json_value "$response" '.status')" != closed ]]; then
+                refuse 'the artifact upload failed'
+            fi
+            ;;
+        409)
+            case "$(json_code "$response")" in
+                sha256_mismatch) refuse 'the artifact digest did not match on the server' ;;
+                not_uploading)
+                    if ((posted != 0)); then
+                        refuse 'the artifact upload was closed by the server'
+                    fi
+                    ;;
+                *) refuse 'the artifact upload failed' ;;
+            esac
+            ;;
+        401) refuse 'the artifact ticket was refused' ;;
+        422) refuse 'the server refused the artifact' ;;
+        *) refuse 'the artifact upload failed' ;;
+    esac
+}
+
+fetch() {
+    local api="$1"
+    local ticket_file="$2"
+    local sha256="$3"
+    local size="$4"
+    local out="$5"
+    local backoff="${CI_ARTIFACT_BACKOFF_SECONDS:-5}"
+    local config have code curled deadline remaining tries=0
+
+    if [[ ! "$sha256" =~ ^[0-9a-f]{64}$ || ! "$size" =~ ^[1-9][0-9]{0,17}$ || ! "$backoff" =~ ^[0-9]+$ ]]; then
+        usage
+    fi
+    if [[ ! -r "$ticket_file" || ! -d "$(dirname -- "$out")" || -d "$out" ]]; then
+        usage
+    fi
+
+    # 1. Whatever this run fails at, no earlier download may pass for its output.
+    rm -f -- "$out" "$out.part"
+    ticket_config "$ticket_file"
+    config="$scratch/ticket.curl"
+    partial="$out.part"
+
+    # 2. A loop around -C -: curl's own --retry throws away the partial bytes a resume starts from.
+    deadline=$((SECONDS + FETCH_SECONDS))
+    while :; do
+        have=0
+        if [[ -f "$partial" ]]; then
+            have="$(file_size "$partial")"
+        fi
+        if ((have >= size)); then
+            break
+        fi
+        remaining=$((deadline - SECONDS))
+        if ((tries >= MAX_FETCH_TRIES || remaining <= 0)); then
+            refuse 'the artifact download failed'
+        fi
+        tries=$((tries + 1))
+
+        # --fail keeps an error body out of the partial file; the status is read from --write-out, not the exit.
+        curled=0
+        code="$(curl -q --config "$config" --fail --silent --show-error --user-agent 'ci-job/1' \
+            --connect-timeout 30 --speed-limit 1024 --speed-time 60 --max-time "$remaining" \
+            --continue-at - --output "$partial" --write-out '%{http_code}' \
+            --url "$api/api/ci/artifact" 2>>"$detail_log")" || curled=$?
+        note "fetch try $tries from $have: status ${code:-none}, curl $curled"
+
+        case "$code" in
+            404) refuse 'the artifact download was refused' ;;
+            409) refuse 'the artifact on the server does not match its record' ;;
+            410) refuse 'the artifact is gone' ;;
+        esac
+        if ((curled == 0)); then
+            break
+        fi
+        # 33: the door answered a resume with the whole file; curl appended nothing, so start over.
+        if ((curled == 33)); then
+            : >"$partial"
+        elif [[ "$code" =~ ^4 && "$code" != 408 && "$code" != 429 ]]; then
+            refuse 'the artifact download failed'
+        fi
+        sleep "$backoff"
+    done
+
+    # 3. Only the ledger's bytes leave this function.
+    if [[ ! -f "$partial" ]] \
+        || [[ "$(file_size "$partial")" != "$size" ]] \
+        || [[ "$(file_sha256 "$partial")" != "$sha256" ]]; then
+        refuse 'the downloaded artifact did not match its digest'
+    fi
+    mv -f -- "$partial" "$out" || refuse 'the artifact download failed'
+    partial=''
+}
+
+unpack() {
+    local archive="$1"
+    local dir="$2"
+    local not_unpacked='the artifact could not be unpacked'
+
+    if [[ ! -f "$archive" || ! -d "$(dirname -- "$dir")" ]]; then
+        usage
+    fi
+
+    # 1. The directory is this run's own, made anew with mode 0700, so nothing placed there earlier meets tar.
+    if [[ -e "$dir" || -L "$dir" ]]; then
+        if [[ -L "$dir" || ! -d "$dir" ]] || ! rmdir -- "$dir" 2>/dev/null; then
+            refuse 'the unpack directory is not empty'
+        fi
+    fi
+    mkdir -m 0700 -- "$dir" 2>/dev/null || refuse "$not_unpacked"
+    unpacked="$dir"
+
+    # 2. As root, GNU tar keeps the archive's owners and modes unless told not to; its stderr can name archive paths.
+    if ! tar -xzf "$archive" --no-same-owner --no-same-permissions --no-overwrite-dir -C "$dir" 2>/dev/null; then
+        refuse "$not_unpacked"
+    fi
+
+    # 3. The bytes are hostile: only regular files and directories may remain, and none keeps the archive's mode.
+    if find_any "$dir" "$not_unpacked" '!' -type f '!' -type d; then
+        refuse 'the artifact holds an entry that is not a regular file or directory'
+    fi
+    if ! find "$dir" \( -type d -exec chmod 0700 {} + \) -o \( -type f -exec chmod 0600 {} + \) 2>/dev/null; then
+        refuse "$not_unpacked"
+    fi
+    unpacked=''
+}
+
+case "${1:-}" in
+    pack)
+        [[ $# -eq 3 ]] || usage
+        pack "$2" "$3"
+        ;;
+    upload)
+        [[ $# -eq 5 ]] || usage
+        upload "$2" "$3" "$4" "$5"
+        ;;
+    fetch)
+        [[ $# -eq 6 ]] || usage
+        fetch "$2" "$3" "$4" "$5" "$6"
+        ;;
+    unpack)
+        [[ $# -eq 3 ]] || usage
+        unpack "$2" "$3"
+        ;;
+    *)
+        usage
+        ;;
+esac

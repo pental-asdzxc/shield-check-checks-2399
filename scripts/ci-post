@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# Sends one HTTP request whose credentials live in a curl config file, and
+# retries while the server or GitHub is briefly unable to answer it.
+#
+# usage: ci-post [-X <method>] <url> <config-file> <response-file> [<body-file>]
+#        ci-post -z <url> <config-file> <response-file> <body-file>
+#        ci-post -t <offset> <url> <config-file> <response-file> <body-file>
+#        ci-post -o <offset> <url> <config-file> <response-file> <body-file>
+#
+# <config-file>   curl config lines such as `header = "Authorization: Bearer ..."`,
+#                 mode 0600. A bearer on the command line would sit in
+#                 /proc/<pid>/cmdline, which every local user can read.
+# <response-file> receives the final response body; <response-file>.status
+#                 receives its HTTP status code (000 when nothing came back).
+# <body-file>     sent as JSON; the method defaults to POST with a body and to
+#                 GET without one.
+# -z              POSTs <body-file> as application/gzip with X-Ci-Run and
+#                 X-Ci-Job taken from CI_RUN_ID and CI_JOB_NAME, and allows
+#                 120 s per attempt instead of 60, for a log upload of up to
+#                 8 MiB.
+# -t <offset>     POSTs <body-file> as text/plain, a live log chunk, with
+#                 X-Ci-Offset: <offset> (decimal bytes) taken from a
+#                 per-request curl config beside <response-file>.
+# -o <offset>     the same for a binary chunk, such as a piece of an artifact
+#                 archive: <body-file> goes as application/octet-stream.
+#
+# CI_POST_SINGLE_TRY_SECONDS, when set, makes exactly one attempt of at most
+# that many seconds and retries nothing, for a caller that bounds its own
+# waiting and tries again later.
+#
+# Retries: 401 up to 3 times (a run id the server stored a moment ago may not
+# be visible yet), 429 and 503 after their Retry-After seconds, 502, 504,
+# 520-524 and transport failures up to 10 times with a growing pause (5, 10,
+# 20, then 30 s; an app server restarting refuses connections for a while),
+# and a 500 up to 3 times; everything, attempts included, within 240 s of wall
+# clock. A 409 after a gateway or transport failure means an earlier attempt
+# landed and only its answer was lost, so it exits 0 with 409 in the status
+# file: the server's endpoints take each token, result and log once. Exits 0
+# on a 2xx and 1 otherwise. Prints nothing on stdout. CI_POST_BACKOFF_SECONDS
+# scales the pauses (tests set 0).
+set -euo pipefail
+
+usage() {
+    echo 'usage: ci-post [-X <method>] <url> <config-file> <response-file> [<body-file>]' >&2
+    echo '       ci-post -z <url> <config-file> <response-file> <body-file>' >&2
+    echo '       ci-post -t <offset> <url> <config-file> <response-file> <body-file>' >&2
+    echo '       ci-post -o <offset> <url> <config-file> <response-file> <body-file>' >&2
+    exit 2
+}
+
+method=''
+gzip=false
+offset=''
+chunk_type=''
+max_time=60
+single_try="${CI_POST_SINGLE_TRY_SECONDS:-}"
+case "${1:-}" in
+    -X)
+        method="${2:-}"
+        shift 2 || usage
+        ;;
+    -z)
+        gzip=true
+        max_time=120
+        shift
+        ;;
+    -t | -o)
+        chunk_type=text/plain
+        if [ "$1" = -o ]; then
+            chunk_type=application/octet-stream
+        fi
+        offset="${2:-}"
+        shift 2 || usage
+        [[ "$offset" =~ ^[0-9]+$ ]] || usage
+        ;;
+esac
+
+if [ $# -lt 3 ] || [ $# -gt 4 ]; then
+    usage
+fi
+
+url="$1"
+config="$2"
+response="$3"
+body="${4:-}"
+headers="$response.headers"
+offset_config="$response.offset.curl"
+
+if [ "$gzip" = true ] && { [ -z "$body" ] || [ -z "${CI_RUN_ID:-}" ] || [ -z "${CI_JOB_NAME:-}" ]; }; then
+    usage
+fi
+
+if [ -n "$offset" ] && [ -z "$body" ]; then
+    usage
+fi
+
+if [ -n "$single_try" ]; then
+    [[ "$single_try" =~ ^[1-9][0-9]*$ ]] || usage
+    max_time="$single_try"
+fi
+
+curl_args=(
+    --config "$config"
+    --silent
+    --show-error
+    --user-agent 'ci-job/1'
+    --dump-header "$headers"
+    --output "$response"
+    --write-out '%{http_code}'
+)
+
+if [ "$gzip" = true ]; then
+    method=POST
+    curl_args+=(
+        --header 'Content-Type: application/gzip'
+        --header "X-Ci-Run: $CI_RUN_ID"
+        --header "X-Ci-Job: $CI_JOB_NAME"
+        --data-binary "@$body"
+    )
+elif [ -n "$offset" ]; then
+    method=POST
+    printf 'header = "X-Ci-Offset: %s"\n' "$offset" >"$offset_config"
+    curl_args+=(
+        --config "$offset_config"
+        --header "Content-Type: $chunk_type"
+        --data-binary "@$body"
+    )
+elif [ -n "$body" ]; then
+    method="${method:-POST}"
+    curl_args+=(
+        --header 'Content-Type: application/json'
+        --data-binary "@$body"
+    )
+fi
+
+curl_args+=(
+    --request "${method:-GET}"
+    --url "$url"
+)
+
+max_unauthorized=3
+max_server_errors=3
+max_gateway_retries=10
+backoff="${CI_POST_BACKOFF_SECONDS:-5}"
+
+# Wall clock, attempts included: a server that accepts and never answers burns
+# every attempt's whole --max-time, and the job has a 20-minute limit. 240 s
+# also stays inside the GitHub OIDC token every attempt reuses.
+deadline=$((SECONDS + 240))
+
+unauthorized=0
+server_errors=0
+gateway_errors=0
+
+# Delta-seconds from the last Retry-After header; an HTTP date or a missing
+# header falls back to 5 seconds.
+retry_after() {
+    local value
+
+    value="$(tr -d '\r' <"$headers" | awk 'tolower($1) == "retry-after:" { v = $2 } END { print v }')"
+
+    if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ]; then
+        echo "$value"
+    else
+        echo 5
+    fi
+}
+
+# usage: finish <status> [delivered]   exits 0 on a 2xx or when told the
+# request was delivered; the status file always holds the real status.
+finish() {
+    printf '%s\n' "$1" >"$response.status"
+    rm -f "$headers"
+    if [ -n "$offset" ]; then
+        rm -f "$offset_config"
+    fi
+
+    if [[ "$1" =~ ^2[0-9][0-9]$ ]] || [ "${2:-}" = delivered ]; then
+        exit 0
+    fi
+
+    exit 1
+}
+
+# True when a pause of <seconds> still leaves time before the deadline.
+can_wait() {
+    [ $((SECONDS + $1)) -lt "$deadline" ]
+}
+
+while :; do
+    : >"$headers"
+    remaining=$((deadline - SECONDS))
+    if [ "$remaining" -gt "$max_time" ]; then
+        remaining="$max_time"
+    fi
+    if [ "$remaining" -lt 5 ]; then
+        remaining=5
+    fi
+
+    # curl prints 000 and exits non-zero when no response arrived; that case is
+    # retried below like a 5xx, and curl's own message is already on stderr.
+    if ! code="$(curl -q --max-time "$remaining" "${curl_args[@]}")"; then
+        code=000
+    fi
+
+    if [ -n "$single_try" ]; then
+        finish "$code"
+    fi
+
+    case "$code" in
+        2??)
+            finish "$code"
+            ;;
+        401)
+            if [ "$unauthorized" -ge "$max_unauthorized" ]; then
+                finish "$code"
+            fi
+            unauthorized=$((unauthorized + 1))
+            sleep 2
+            ;;
+        429 | 503)
+            delay="$(retry_after)"
+            if ! can_wait "$delay"; then
+                finish "$code"
+            fi
+            sleep "$delay"
+            ;;
+        409)
+            # Only after a gateway or transport failure: a first-attempt 409 is a real replay. The body is the
+            # refusal, not data; the status file keeps the 409.
+            if [ "$gateway_errors" -gt 0 ]; then
+                finish "$code" delivered
+            fi
+            finish "$code"
+            ;;
+        000 | 502 | 504 | 52[0-4])
+            # 520 to 524 are Cloudflare's answers for an origin that is down or slow.
+            delay=$((backoff * (1 << gateway_errors)))
+            if [ "$delay" -gt $((backoff * 6)) ]; then
+                delay=$((backoff * 6))
+            fi
+            if [ "$gateway_errors" -ge "$max_gateway_retries" ] || ! can_wait "$delay"; then
+                finish "$code"
+            fi
+            gateway_errors=$((gateway_errors + 1))
+            sleep "$delay"
+            ;;
+        5??)
+            if [ "$server_errors" -ge "$max_server_errors" ]; then
+                finish "$code"
+            fi
+            server_errors=$((server_errors + 1))
+            sleep "$backoff"
+            ;;
+        *)
+            finish "$code"
+            ;;
+    esac
+done

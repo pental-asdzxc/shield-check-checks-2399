@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Ships a built web tree to a box over ssh and uploads its source maps.
+#
+# usage: ci-ship rsync <dir> <ssh-config> <host> <port>
+#        ci-ship sentry <dir> <secrets-dir> <release>
+#
+# rsync   Sends <dir>/ to the target's `./` in two passes. Pass 1 carries
+#         everything except /version.json and the source maps, deletes late
+#         (--delete-delay) and moves files into place only when the whole
+#         pass has arrived (--delay-updates). Pass 2 sends version.json alone,
+#         when the file exists, so whatever compares itself with that file
+#         never sees a build whose files are not all on disk yet. The
+#         excluded files are also exempt from deletion, which is why
+#         --delete-excluded and -a are never passed: the former would delete
+#         them on the box, the latter would carry owners, links and devices.
+#         Modes are forced to 644 and 755 and owners are left to the target.
+#         ssh runs with <ssh-config> (-F), BatchMode and <port>; <host> must
+#         be a bare host name or address and <ssh-config> a file whose path
+#         holds no whitespace (rsync splits its -e string on it).
+# sentry  Creates release <release> (seven lowercase hex digits) and uploads
+#         <dir> with sentry-cli: the maps plus the scripts they belong to, the
+#         way the manual flow does, instead of a maps-only filter. Every
+#         SENTRY_* file in <secrets-dir> becomes an environment variable of
+#         sentry-cli only, set with `export` inside a subshell so the values
+#         never sit in an argv. Skipped, exit 0, when the SENTRY_AUTH_TOKEN
+#         file is absent or <dir> holds no *.map file.
+#
+# Tool output goes to $CI_STATE_DIR/ci-ship.log (discarded when unset); stderr
+# gets only a fixed `ci:` line. Exit 0 on success or skip, 1 when a tool
+# fails, 2 on a refused argument.
+set -Eeuo pipefail
+
+log=/dev/null
+if [[ -n "${CI_STATE_DIR:-}" ]]; then
+    log="$CI_STATE_DIR/ci-ship.log"
+fi
+
+refuse() {
+    echo "ci: $1" >&2
+    exit 2
+}
+
+fail() {
+    echo "ci: $1" >&2
+    exit 1
+}
+
+usage() {
+    refuse 'usage: ci-ship rsync <dir> <ssh-config> <host> <port> | sentry <dir> <secrets-dir> <release>'
+}
+
+# usage: ship_rsync <dir> <ssh-config> <host> <port>
+ship_rsync() {
+    local dir="${1%/}" config="$2" host="$3" port="$4"
+
+    # 1. Everything below reaches a command line, so check each value before any tool runs.
+    [[ "$host" =~ ^[A-Za-z0-9._-]{1,253}$ && "$host" != -* ]] || refuse 'ship refused: bad host'
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || refuse 'ship refused: bad port'
+    [[ -d "$dir" ]] || refuse 'ship refused: no build directory'
+    [[ -f "$config" && "$config" != *[[:space:]]* ]] || refuse 'ship refused: bad ssh config'
+
+    local ssh_command="ssh -F $config -o BatchMode=yes -p $port"
+
+    # 2. The bulk of the tree. The version marker and the maps stay out, and --delete-excluded stays off, so
+    #    the box's own copy of the marker survives until pass 2.
+    rsync -rt --perms --chmod=D755,F644 --no-owner --no-group --delete-delay --delay-updates \
+        --exclude=/version.json '--exclude=*.map' \
+        -e "$ssh_command" "$dir/" "$host:./" >>"$log" 2>&1 || fail 'ship failed: tree'
+
+    # 3. The marker goes last: it tells a reader that the files it names are all in place.
+    if [[ -f "$dir/version.json" ]]; then
+        rsync -t --perms --chmod=F644 \
+            -e "$ssh_command" "$dir/version.json" "$host:./" >>"$log" 2>&1 || fail 'ship failed: version marker'
+    fi
+}
+
+# usage: ship_sentry <dir> <secrets-dir> <release>
+ship_sentry() {
+    local dir="${1%/}" secrets="${2%/}" release="$3"
+
+    [[ "$release" =~ ^[0-9a-f]{7}$ ]] || refuse 'ship refused: bad release'
+    [[ -d "$dir" ]] || refuse 'ship refused: no build directory'
+    [[ -d "$secrets" ]] || refuse 'ship refused: no secrets directory'
+
+    if [[ ! -f "$secrets/SENTRY_AUTH_TOKEN" || -z "$(find "$dir" -name '*.map' -print -quit)" ]]; then
+        echo 'ci: sentry upload skipped' >&2
+        return 0
+    fi
+
+    # A subshell keeps the credentials out of this shell and its other children; `export` is a builtin, so the
+    # values never reach an argv the way `env NAME=value command` would.
+    (
+        local file name
+        for file in "$secrets"/SENTRY_*; do
+            name="${file##*/}"
+            [[ "$name" =~ ^SENTRY_[A-Z0-9_]+$ && -f "$file" ]] || continue
+            export "$name=$(<"$file")"
+        done
+
+        sentry-cli releases new "$release" >>"$log" 2>&1 || exit 1
+        sentry-cli sourcemaps upload --release "$release" "$dir" >>"$log" 2>&1 || exit 1
+    ) || fail 'ship failed: sentry upload'
+}
+
+case "${1:-}" in
+    rsync)
+        [[ $# -eq 5 ]] || usage
+        ship_rsync "$2" "$3" "$4" "$5"
+        ;;
+    sentry)
+        [[ $# -eq 4 ]] || usage
+        ship_sentry "$2" "$3" "$4"
+        ;;
+    *)
+        usage
+        ;;
+esac

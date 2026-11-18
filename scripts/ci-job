@@ -1,0 +1,3204 @@
+#!/usr/bin/env bash
+# One virtual CI job, in the two steps ci.yml calls:
+#
+# usage: ci-job prepare | run
+#
+# prepare  trades an OIDC token (aud CI_TOKEN_AUDIENCE) for the job's facts, the
+#          repository's manifest block for this job's stack and a short-lived
+#          installation token, fetches the private head and base commits with
+#          it, revokes it, resolves the manifest's directory, lets the
+#          repository's own scope script decide the scope (as uid 2000; in pr
+#          mode the base commit's copy of it), removes .git, and writes
+#          cache_key, cache_scope and mode to $GITHUB_OUTPUT (masked). ci.yml
+#          then restores the dependency cache into
+#          /ci/cache, before any pull request code has run.
+# run      installs dependencies and runs the role's manifest commands as uid
+#          2000 through ci-sandbox, kills every uid 2000 process, and only then
+#          fetches a fresh OIDC token (aud CI_RESULTS_AUDIENCE) to post the
+#          results. It posts on a failed command (status failed) and on an
+#          internal error (status errored) too. Role `job (N)` runs the
+#          server's declared steps instead of the manifest's, in order, until
+#          CI_JOB_CEILING_SECONDS after prepare began; a step cut there is
+#          errored.
+#
+# Environment: CI_RUN_ID (lowercase UUID), CI_JOB_NAME (`lint`, `test (2)`,
+# `flutter-test (1)`, `job (3)`), CI_API (the server's base URL),
+# CI_TOKEN_AUDIENCE and CI_RESULTS_AUDIENCE (the two OIDC audiences), none
+# with a default, and the
+# runner's ACTIONS_ID_TOKEN_REQUEST_URL and _TOKEN (job permission id-token: write).
+#
+# The manifest and the cache namespace come from the token response only,
+# never from the checkout. Every manifest command runs as `bash -c` under
+# ci-sandbox in the manifest's directory with CI_REPORT_DIR (a uid 2000
+# directory for junit.xml, pint.json or flutter.json), CI_SHARD and
+# CI_SHARDS (test roles), CI_SCOPE_PHP and CI_SCOPE_FILTER (laravel with a
+# scope script) and CI_CHANGED_FILES (a file of repository-relative paths
+# changed since the scope's pint_base; unset when everything is checked). A
+# build step gets only CI_RELEASE, the first seven characters of the head
+# commit: its tree has no .git.
+#
+# The public log gets fixed `ci:` lines only, never a manifest command, a
+# directory or a repository name. Every command's own output goes to
+# root-only logs under /ci/state, because an error message (git's, jq's) can
+# quote the private repository name or a token. No secret is ever an
+# argument: curl reads headers from 0600 config files, git reads the token
+# through GIT_ASKPASS, or, when the token response turns features.git_proxy
+# on, takes the ticket and the token from http.extraHeader values in its
+# environment and fetches through the Worker's /git. features.log_upload
+# sends the redacted root-only logs to the server once the results are in.
+# A `live` object with two tickets in the token response makes every sandboxed
+# step an event and ci-live stream the redacted step logs while the job runs;
+# that stream is best effort and never decides or delays the job past
+# CI_LIVE_STOP_SECONDS.
+#
+# A job named `deploy` is not a test job. It carries no repository code: the
+# box fetches the commit itself. prepare only names a cache nothing else can
+# seed; run makes an ephemeral Ed25519 key, trades the OIDC token and the
+# key's public half for a short-lived OpenSSH certificate (retrying while the
+# server answers 503), reaches the target the answer names with
+# StrictHostKeyChecking=yes against its pinned host key, passes the commit as
+# the ssh command (the box's principals file decides what that runs), and
+# reports passed, failed or errored. What the box prints stays in the root-only
+# log: it never reaches the public log or the results, which carry the status
+# only. No log is uploaded.
+#
+# An answer of kind rsync carries an artifact: run checks its digest, ticket,
+# secrets and tailnet key first, then, under an EXIT trap that leaves the
+# tailnet and removes everything below, writes each secret to its own 0400 file
+# in a 0700 directory under ${CI_RUN_DIR:-/run}, fetches and unpacks the
+# archive, joins the tailnet (reach tailscale), uploads the source maps (with a
+# SENTRY_AUTH_TOKEN secret) and ships the tree with ci-ship rsync through an ssh
+# config of the same settings, each under the time left before the ceiling. No
+# byte of the artifact is run, and no secret, key or ticket is an argument.
+#
+# A job named `build` builds an artifact. prepare trades the OIDC token for the
+# build (retrying while the server answers 503, stopping at a 409), checks every
+# field of the answer, keeps the upload ticket in a 0600 file, fetches the head
+# with the source token and revokes it, and names a cache nothing else can seed.
+# run runs the answer's steps in order as build-1..build-N in its directory, as
+# uid 2000 through ci-sandbox, until CI_BUILD_CEILING_SECONDS after prepare
+# began; resolves the directory and the output path again, packs the output as
+# uid 2000 into a directory root made, uploads root's copy of the archive to
+# the artifact door, and posts {ci_run_id, status, log_tail}: the redacted tail
+# of the step logs, at most 32768 bytes. A build never holds a secret beyond
+# its source token and its ticket.
+#
+# Exits 0 once the server accepted the results, whatever their status, so the
+# public run carries no verdict on private code; 1 when they were not
+# delivered or prepare failed.
+set -Eeuo pipefail
+
+root=/ci
+state="$root/state"
+secret="$root/secret"
+tree="$root/tree"
+out="$root/out"
+cache="$root/cache"
+changed_files="$root/changed-files"
+scope_file="$root/scope-script"
+artifact_dir="$root/artifact"
+sandbox_uid=2000
+# Pause before a fetch's second try; each later one doubles, up to 60 s, plus
+# up to CI_FETCH_JITTER_SECONDS so shards refused together retry apart.
+CI_FETCH_BACKOFF_SECONDS="${CI_FETCH_BACKOFF_SECONDS:-10}"
+CI_FETCH_JITTER_SECONDS="${CI_FETCH_JITTER_SECONDS:-5}"
+# A deploy job waits this long for its certificate (the server answers 503 while
+# another deploy of the target still runs or the commit's head cannot be read;
+# one try of ci-post can run up to 240 s past it), and must have reported by the
+# ceiling, counted from the start of the run step. The pool workflow stops a
+# job at 20 minutes, image pull and prepare included, which would cut an ssh
+# session in the middle of the box's script.
+CI_DEPLOY_WAIT_SECONDS="${CI_DEPLOY_WAIT_SECONDS:-480}"
+CI_DEPLOY_CEILING_SECONDS="${CI_DEPLOY_CEILING_SECONDS:-1020}"
+# A declared job's steps must be over by this many seconds after prepare's
+# first line, for the same 20 minute limit; only role job reads it.
+CI_JOB_CEILING_SECONDS="${CI_JOB_CEILING_SECONDS:-1020}"
+# A build's steps and its pack must be over by this many seconds after
+# prepare's first line, for the same 20 minute limit. Its exchange waits at
+# most CI_BUILD_WAIT_SECONDS for a server that answers 503: the row is dispatched
+# a moment after the job can start, and every second waited is a build second.
+CI_BUILD_CEILING_SECONDS="${CI_BUILD_CEILING_SECONDS:-1020}"
+CI_BUILD_WAIT_SECONDS="${CI_BUILD_WAIT_SECONDS:-240}"
+# How long report waits for ci-live's last flush before it kills the uploader.
+CI_LIVE_STOP_SECONDS="${CI_LIVE_STOP_SECONDS:-15}"
+api="${CI_API:-}"
+api="${api%/}"
+token_audience="${CI_TOKEN_AUDIENCE:-}"
+results_audience="${CI_RESULTS_AUDIENCE:-}"
+
+phase=''
+status=errored
+base_sha=''
+merge_base_sha=''
+last_log=''
+# `transient` when the job broke on the edge (a fetch or token exchange kept
+# refused) before any repository code ran, so the server may run it again.
+failure_reason=''
+reporting=false
+sandbox_env=()
+git_proxy=false
+log_upload=false
+# Live progress: on when the token response carried both live tickets. live_pid is ci-live's, while it runs.
+live=false
+live_pid=''
+# A deploy job: `deploying` is the job's name, `deploy_certified` is true once
+# the server moved its row to Running (a certificate was handed out, or an
+# earlier answer for it was lost), which is when a result can be posted.
+deploying=false
+deploy_certified=false
+deploy_outcome=''
+# The `-o` settings every ssh connection of a deploy takes, and the directory an
+# artifact deploy keeps its secrets, its archive and its tree in until it ends.
+deploy_ssh=()
+deploy_run=''
+# A build job: `building` is the job's name, `build_started` is true once the
+# server moved its row to Running (the answer arrived, or an earlier one for it
+# was lost), which is when a result can be posted. build_note is the fixed line
+# that ends the posted tail.
+building=false
+build_started=false
+build_outcome=''
+build_note=''
+# The token door's last answer to a deploy or a build: its HTTP status and the server's error code.
+exchange_code=''
+exchange_reason=''
+# What the last sandboxed call under a job deadline did: the step's exit code,
+# or step_not_started=true when no time was left to start it.
+step_code=0
+step_not_started=false
+
+say() {
+    printf 'ci: %s\n' "$1" >&3
+}
+
+http_status() {
+    cat "$1.status" 2>/dev/null || echo 000
+}
+
+# usage: sandboxed [--postgres] <log-name> <workdir> [NAME=VALUE ...] -- <command> [arg ...]
+sandboxed() {
+    local flags=()
+
+    if [ "$1" = --postgres ]; then
+        flags=(--postgres)
+        shift
+    fi
+
+    local name="$1"
+    local workdir="$2"
+    shift 2
+
+    local started="${EPOCHREALTIME/,/.}"
+    local finished
+    local code=0
+    local remaining
+    local bound=()
+
+    # Under run_job's deadline (dynamically scoped, unset for every other
+    # role) the step gets what is left of it, and none when nothing is: timeout
+    # reads 0 as no limit at all. The step that never ran is the one the result
+    # names, with a log of its own, so the passing step before it is not blamed.
+    if [ -n "${job_deadline:-}" ]; then
+        remaining=$((job_deadline - $(date +%s)))
+        if [ "$remaining" -le 0 ]; then
+            step_not_started=true
+            last_log="$name"
+            printf 'not started: the job ceiling was reached\n' >"$state/$name.log"
+            return 1
+        fi
+        bound=(timeout --kill-after=15 "$remaining")
+    fi
+
+    last_log="$name"
+    live_step_started "$name" || true
+    "${bound[@]}" ci-sandbox "${flags[@]}" "$state/$name.log" "$workdir" "${sandbox_env[@]}" "$@" || code=$?
+    step_code="$code"
+    finished="${EPOCHREALTIME/,/.}"
+
+    # The private logs say where a job's minutes went; the public one stays silent. A separate file, because
+    # some logs are data (changed-files.log becomes CI_CHANGED_FILES). EPOCHREALTIME and awk follow the
+    # locale's decimal mark, so both are pinned to a dot.
+    LC_ALL=C awk -v name="$name" -v from="$started" -v to="$finished" \
+        'BEGIN { printf "%s took %.1f s\n", name, to - from }' >>"$state/durations.log"
+    live_step_finished "$name" "$code" "$started" "$finished" || true
+
+    return "$code"
+}
+
+# usage: live_event <kind> <step> [payload-json]
+# Appends the next event to $state/live/events.ndjson for ci-live to send. The
+# main shell is the only writer, in prepare and in run, so the next seq is the
+# line count plus one. <step> is one of ci-job's own fixed labels, never a
+# command, a path or a repository value.
+live_event() {
+    local events="$state/live/events.ndjson"
+    local seq
+
+    if [ "$live" != true ]; then
+        return 0
+    fi
+
+    seq=$(($(wc -l <"$events") + 1))
+    jq -cn \
+        --argjson seq "$seq" \
+        --arg kind "$1" \
+        --arg step "$2" \
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --argjson payload "${3:-null}" \
+        '{seq: $seq, kind: $kind, step: $step, at: $at, payload: $payload}' >>"$events"
+}
+
+# Records <log-name> in the order ci-live streams the logs, and its start. The
+# test listing is planning input that never reaches the uploaded logs, so it
+# stays out of the stream too.
+live_step_started() {
+    if [ "$live" != true ]; then
+        return 0
+    fi
+
+    if [ "$1" != list-tests ]; then
+        printf '%s\n' "$1" >>"$state/live/order"
+    fi
+    live_event step_started "$1"
+}
+
+# usage: live_step_finished <log-name> <exit> <started> <finished>
+live_step_finished() {
+    if [ "$live" != true ]; then
+        return 0
+    fi
+
+    live_event step_finished "$1" "$(
+        LC_ALL=C awk -v code="$2" -v from="$3" -v to="$4" \
+            'BEGIN { printf "{\"exit\":%d,\"seconds\":%.1f}", code, to - from }'
+    )"
+}
+
+# Starts ci-live in the background. It prints nothing anywhere the job's
+# output goes and cannot write to the public log (fd 3 is closed for it).
+live_start() {
+    if [ "$live" != true ]; then
+        return 0
+    fi
+
+    ci-live "$api" "$state" "$secret" </dev/null >>"$state/live/uploader.out" 2>&1 3>&- &
+    live_pid=$!
+}
+
+# Lets ci-live send what is left, then kills it and every process under it, so
+# report never waits on it past CI_LIVE_STOP_SECONDS. In prepare, where no
+# uploader runs, it starts one for that last flush only. Called as `|| true`:
+# nothing here may fail the job.
+live_stop() {
+    local deadline=$((SECONDS + CI_LIVE_STOP_SECONDS))
+    local pids=()
+    local pid
+
+    if [ "$live" != true ]; then
+        return 0
+    fi
+
+    live_event status report "$(jq -cn --arg status "$status" '{status: $status}')"
+    : >"$state/live/stop"
+    if [ -z "$live_pid" ]; then
+        live_start
+    fi
+
+    while [ ! -e "$state/live/done" ] && [ "$SECONDS" -lt "$deadline" ]; do
+        sleep 0.2
+    done
+
+    # Parent first, so it starts nothing new; a child it started a moment
+    # before the listing ends on its own --max-time.
+    while IFS= read -r pid; do
+        pids+=("$pid")
+    done < <(live_tree "$live_pid")
+    kill -9 "${pids[@]}" 2>/dev/null
+    wait "$live_pid" 2>/dev/null
+    live_pid=''
+    # ci-live's own exit trap removes its configs, which a kill -9 skips.
+    rm -f "$secret/live-events-ticket" "$secret/live-chunk-ticket" "$secret/live-events.curl" "$secret/live-chunk.curl"
+}
+
+# Prints <pid> and every process under it, parents first.
+live_tree() {
+    local child
+
+    printf '%s\n' "$1"
+    for child in $(pgrep -P "$1"); do
+        live_tree "$child"
+    done
+}
+
+# Prints the real path of <dir> inside <tree>, or fails for an absolute path,
+# a `..` component, a symlink at any component, anything but a directory, and
+# whatever realpath places outside <tree>. The manifest names <dir> and the
+# checkout is pull request code, so both are untrusted.
+resolve_dir() {
+    local tree_root="$1"
+    local dir="$2"
+    local path
+    local component
+    local components=()
+    local resolved
+
+    if ! [[ "$dir" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$dir" == /* ]]; then
+        return 1
+    fi
+
+    tree_root="$(realpath "$tree_root")" || return 1
+    path="$tree_root"
+
+    IFS=/ read -r -a components <<<"$dir"
+    for component in "${components[@]}"; do
+        case "$component" in
+            '' | .) continue ;;
+            ..) return 1 ;;
+        esac
+
+        path="$path/$component"
+        if [ -L "$path" ] || [ ! -d "$path" ]; then
+            return 1
+        fi
+    done
+
+    resolved="$(realpath "$path")" || return 1
+    if [ "$resolved" != "$tree_root" ] && [[ "$resolved" != "$tree_root"/* ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "$resolved"
+}
+
+# Writes a curl config carrying a fresh OIDC token for <audience>. The runner's
+# request token goes to one 0600 config, the JWT it returns to another.
+oidc_config() {
+    local audience="$1"
+    local config="$2"
+    local request_token="${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+
+    if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || ! [[ "$request_token" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
+        say 'no OIDC request token; the job needs permission id-token: write'
+        return 1
+    fi
+
+    printf 'header = "Authorization: Bearer %s"\n' "$request_token" >"$secret/oidc-request.curl"
+
+    if ! ci-post "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$audience" "$secret/oidc-request.curl" "$secret/oidc.json"; then
+        say "OIDC token request failed (HTTP $(http_status "$secret/oidc.json"))"
+        rm -f "$secret/oidc-request.curl" "$secret/oidc.json"
+        return 1
+    fi
+
+    jq -er '
+        .value
+        | select(type == "string" and test("^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$"))
+        | "header = \"Authorization: Bearer \(.)\"\nheader = \"Accept: application/json\""
+    ' "$secret/oidc.json" >"$config"
+
+    rm -f "$secret/oidc-request.curl" "$secret/oidc.json" "$secret/oidc.json.status"
+}
+
+# Through the Worker the revocation goes to its /gh-token with the ticket
+# header github.curl then carries.
+revoke_token() {
+    local revoked=true
+    local url=https://api.github.com/installation/token
+
+    if [ ! -f "$secret/github.curl" ]; then
+        return 0
+    fi
+
+    if [ "$git_proxy" = true ]; then
+        url="$api/gh-token"
+    fi
+
+    # A 401 means the token no longer works, which is the point: a retried DELETE whose first attempt landed
+    # meets exactly that. The Worker answers a bad ticket with 404, so that case still fails.
+    if ! ci-post -X DELETE "$url" "$secret/github.curl" "$state/revoke.json" \
+        && [ "$(http_status "$state/revoke.json")" != 401 ]; then
+        revoked=false
+    fi
+
+    rm -f "$secret/github.curl" "$secret/github-token" "$secret/askpass" "$secret/token.json" "$secret/git-ticket"
+
+    if [ "$revoked" = false ]; then
+        say "installation token revocation failed (HTTP $(http_status "$state/revoke.json"))"
+        return 1
+    fi
+}
+
+write_empty_summary() {
+    jq -n '{counts: {tests: 0, failures: 0, errors: 0, skipped: 0}, failures: [], annotations: []}' \
+        >"$state/summary.json"
+}
+
+# Turns a JUnit XML, Pint JSON or Flutter JSON reporter file into {counts,
+# failures, annotations}. The file came out of the sandbox, so it is parsed as
+# data only: no network, no entity expansion beyond libxml's defaults, invalid
+# UTF-8 substituted. The flutter image ships PHP 8.2, so nothing newer is used.
+summarise() {
+    php -d memory_limit=1G -- "$1" "$2" "$tree/" >"$state/summary.json" <<'PHP'
+<?php
+
+[, $kind, $file, $prefix] = $argv;
+
+$relative = static fn (string $path): string => str_starts_with($path, $prefix)
+    ? substr($path, strlen($prefix))
+    : $path;
+$clip = static fn (string $text): string => mb_substr($text, 0, 2000);
+
+$summary = [
+    'counts' => [
+        'tests' => 0,
+        'failures' => 0,
+        'errors' => 0,
+        'skipped' => 0,
+    ],
+    'failures' => [],
+    'annotations' => [],
+];
+
+// Failures only: the server turns every failure with a file and line into an
+// annotation, so sending annotations too would show each one twice.
+$fail = static function (string $path, int $line, string $name, string $message) use (&$summary, $clip): void {
+    $summary['failures'][] = [
+        'file' => $path,
+        'line' => $line,
+        'name' => $name,
+        'message' => $clip($message),
+    ];
+};
+
+if ($kind === 'junit') {
+    $xml = simplexml_load_file($file, null, LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING);
+
+    if ($xml === false) {
+        exit(1);
+    }
+
+    $slow = [];
+    $classes = [];
+
+    foreach ($xml->xpath('//testcase') ?: [] as $case) {
+        $summary['counts']['tests']++;
+        $name = trim($case['class'].'::'.$case['name'], ':');
+        $path = $relative((string) $case['file']);
+        $line = (int) $case['line'];
+        $seconds = max(0.0, (float) $case['time']);
+        $class = (string) $case['class'];
+
+        // The server refuses a key that is not a class name, which would cost the whole result.
+        if (preg_match('/^[A-Za-z_\\\\][A-Za-z0-9_\\\\]{0,254}$/', $class) === 1) {
+            $classes[$class] = ($classes[$class] ?? 0.0) + $seconds;
+        }
+
+        // The server requires a name; an unnamed entry would cost the whole result.
+        if ($seconds >= 2.0 && $name !== '') {
+            $slow[] = [
+                'name' => mb_substr($name, 0, 500),
+                'file' => mb_substr($path, 0, 500),
+                'line' => max(0, $line),
+                'seconds' => round($seconds, 3),
+            ];
+        }
+
+        if (isset($case->failure)) {
+            $summary['counts']['failures']++;
+            $fail($path, $line, $name, trim((string) $case->failure));
+        } elseif (isset($case->error)) {
+            $summary['counts']['errors']++;
+            $fail($path, $line, $name, trim((string) $case->error));
+        } elseif (isset($case->skipped)) {
+            $summary['counts']['skipped']++;
+        }
+    }
+
+    usort($slow, static fn (array $a, array $b): int => $b['seconds'] <=> $a['seconds']);
+    arsort($classes);
+
+    $summary['slow_tests'] = array_slice($slow, 0, 50);
+    $summary['class_timings'] = (object) array_map(
+        static fn (float $total): float => round($total, 3),
+        array_slice($classes, 0, 5000, true),
+    );
+}
+
+if ($kind === 'pint') {
+    $report = json_decode((string) file_get_contents($file), true, 64, JSON_THROW_ON_ERROR);
+
+    foreach ($report['files'] ?? [] as $entry) {
+        $fixers = implode(', ', array_map('strval', (array) ($entry['fixers'] ?? [])));
+        $summary['counts']['failures']++;
+        $fail($relative((string) ($entry['path'] ?? '')), 1, 'Pint', "Pint would fix: {$fixers}");
+    }
+}
+
+// One JSON event per line. A test is counted at its testDone; a hidden test
+// (the synthetic "loading <file>" one) counts only when it did not pass,
+// which is how a compile error shows up. The location is, in order:
+//   1. the test's own url and line when that is a *_test.dart file: in a
+//      bundle entry that imports the test files, root_url is the bundle and
+//      only url names the test file;
+//   2. inside a bundle, the test file its outermost named group is called
+//      after (bundlers name the group by the file's path beside the entry),
+//      at line 0, when that file exists: a test a helper declared, testWidgets
+//      among them, has the helper as url and the bundle as root_url;
+//   3. root_url and root_line, the line inside the suite that reached the
+//      helper.
+//
+// file_timings sums the seconds of every test the reporter placed in a file,
+// hidden setUpAll and tearDownAll included; the load test (the compile) has
+// no url and stays out. A test file can split over shards, so the server sums
+// the shards.
+if ($kind === 'flutter') {
+    $handle = fopen($file, 'rb');
+
+    if ($handle === false) {
+        exit(1);
+    }
+
+    $suites = [];
+    $tests = [];
+    $errors = [];
+    $slow = [];
+    $files = [];
+    $groups = [];
+    $fileKey = '#^(?!(?:.*/)?\.\.(?:/|$))[A-Za-z0-9_][A-Za-z0-9_./-]{0,254}\z#';
+    $path = static fn (mixed $url): string => $relative(rawurldecode(preg_replace('#^file://#', '', (string) $url)));
+
+    $locate = static function (array $test) use ($path, &$suites, &$groups, $prefix, $fileKey): array {
+        if (str_ends_with((string) ($test['url'] ?? ''), '_test.dart')) {
+            return [$path($test['url']), (int) ($test['line'] ?? 0)];
+        }
+
+        $root = $path($test['root_url'] ?? $test['url'] ?? $suites[(int) ($test['suiteID'] ?? -1)] ?? '');
+        $outer = '';
+
+        foreach ((array) ($test['groupIDs'] ?? []) as $groupId) {
+            $outer = $groups[(int) $groupId] ?? '';
+
+            if ($outer !== '') {
+                break;
+            }
+        }
+
+        $dir = dirname($root);
+        $named = $dir === '.' ? $outer : $dir.'/'.$outer;
+
+        // The group name came out of the sandbox: only a relative path to an existing test file is taken.
+        if (! str_ends_with($root, '_test.dart')
+            && str_ends_with($outer, '_test.dart')
+            && preg_match($fileKey, $named) === 1
+            && is_file($prefix.$named)) {
+            return [$named, 0];
+        }
+
+        return [$root, (int) ($test['root_line'] ?? $test['line'] ?? 0)];
+    };
+
+    while (($line = fgets($handle)) !== false) {
+        $event = json_decode($line, true, 64);
+
+        if (! is_array($event)) {
+            continue;
+        }
+
+        $type = $event['type'] ?? null;
+
+        if ($type === 'suite') {
+            $suites[(int) ($event['suite']['id'] ?? -1)] = (string) ($event['suite']['path'] ?? '');
+        } elseif ($type === 'group') {
+            $groups[(int) ($event['group']['id'] ?? -1)] = (string) ($event['group']['name'] ?? '');
+        } elseif ($type === 'testStart') {
+            $test = (array) ($event['test'] ?? []);
+            [$location, $declaredAt] = $locate($test);
+            $tests[(int) ($test['id'] ?? -1)] = [
+                'file' => $location,
+                'line' => $declaredAt,
+                'name' => str_replace($prefix, '', (string) ($test['name'] ?? '')),
+                'started' => (int) ($event['time'] ?? 0),
+                'placed' => isset($test['url']) || isset($test['root_url']),
+            ];
+        } elseif ($type === 'error') {
+            $errors[(int) ($event['testID'] ?? -1)][] = trim(
+                ((string) ($event['error'] ?? ''))."\n".((string) ($event['stackTrace'] ?? '')),
+            );
+        } elseif ($type === 'testDone') {
+            $id = (int) ($event['testID'] ?? -1);
+            $result = (string) ($event['result'] ?? 'success');
+            $test = $tests[$id] ?? ['file' => '', 'line' => 0, 'name' => '', 'started' => null, 'placed' => false];
+
+            // The reporter's times are milliseconds since the run started.
+            $seconds = $test['started'] === null ? 0.0 : max(0, (int) ($event['time'] ?? 0) - $test['started']) / 1000;
+
+            // The server refuses a key that is not a relative path, which would cost the whole result.
+            if ($test['placed'] && preg_match($fileKey, $test['file']) === 1) {
+                $files[$test['file']] = ($files[$test['file']] ?? 0.0) + $seconds;
+            }
+
+            if (($event['hidden'] ?? false) === true && $result === 'success') {
+                continue;
+            }
+
+            $summary['counts']['tests']++;
+            $message = implode("\n\n", $errors[$id] ?? []);
+
+            if ($seconds >= 2.0 && $test['name'] !== '') {
+                $slow[] = [
+                    'name' => mb_substr($test['name'], 0, 500),
+                    'file' => mb_substr($test['file'], 0, 500),
+                    'line' => max(0, $test['line']),
+                    'seconds' => round($seconds, 3),
+                ];
+            }
+
+            if (($event['skipped'] ?? false) === true) {
+                $summary['counts']['skipped']++;
+            } elseif ($result === 'failure') {
+                $summary['counts']['failures']++;
+                $fail($test['file'], $test['line'], $test['name'], $message);
+            } elseif ($result === 'error') {
+                $summary['counts']['errors']++;
+                $fail($test['file'], $test['line'], $test['name'], $message);
+            }
+        }
+    }
+
+    fclose($handle);
+
+    usort($slow, static fn (array $a, array $b): int => $b['seconds'] <=> $a['seconds']);
+    arsort($files);
+
+    $summary['slow_tests'] = array_slice($slow, 0, 50);
+    $summary['file_timings'] = (object) array_map(
+        static fn (float $total): float => round($total, 3),
+        array_slice($files, 0, 5000, true),
+    );
+}
+
+echo json_encode($summary, JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+PHP
+}
+
+# Copies a result file out of $out as uid 2000, so a symlink planted in its
+# place resolves with the sandbox's rights rather than root's.
+collect() {
+    local kind="$1"
+    local name="$2"
+    local copy="$state/result.$kind"
+
+    write_empty_summary
+    rm -f "$copy"
+
+    if ! ci-sandbox "$copy" "$out" -- head -c 67108864 "$name"; then
+        return 0
+    fi
+
+    if ! summarise "$kind" "$copy"; then
+        write_empty_summary
+    fi
+
+    if [ "$kind" = junit ]; then
+        class_timings "$copy"
+    fi
+}
+
+# Writes each test class's summed seconds, slowest first, to the root-only
+# timings log, which upload_logs sends with the rest. The shard split is
+# judged by these figures, never by test counts. An unreadable report writes
+# nothing: the timings are evidence, never part of the verdict.
+class_timings() {
+    php -d memory_limit=1G -- "$1" >"$state/timings.tmp" <<'PHP' || true
+<?php
+
+$xml = simplexml_load_file($argv[1], null, LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING);
+
+if ($xml === false) {
+    exit(1);
+}
+
+$seconds = [];
+
+foreach ($xml->xpath('//testcase') ?: [] as $case) {
+    $class = (string) $case['class'];
+    $seconds[$class] = ($seconds[$class] ?? 0.0) + (float) $case['time'];
+}
+
+arsort($seconds);
+
+foreach ($seconds as $class => $total) {
+    printf("%.3f %s\n", $total, $class);
+}
+PHP
+
+    if [ -s "$state/timings.tmp" ]; then
+        mv "$state/timings.tmp" "$state/timings.log"
+    else
+        rm -f "$state/timings.tmp"
+    fi
+}
+
+# usage: plan_shard <list-tests output> <timings json> <shard> <shards>
+# Prints the PHPUnit --filter that selects this shard's classes. Every shard
+# computes the same plan from the same listing and timings: the classes the
+# listing names, slowest first, each onto the least loaded shard (ties to the
+# lower shard). A class without a timing counts as the median of the listed
+# ones; a timed class the listing lacks is gone and is skipped. An empty map
+# weighs every class the same, which deals them in listing order. Fails when
+# the listing names no class or the timings are unreadable, so the caller
+# falls back to paratest's sequential split. Data only, like summarise.
+plan_shard() {
+    php -d memory_limit=1G -- "$1" "$2" "$3" "$4" <<'PHP'
+<?php
+
+[, $listFile, $timingsFile, $shard, $shards] = $argv;
+$shard = (int) $shard;
+$shards = (int) $shards;
+
+$listing = @file($listFile, FILE_IGNORE_NEW_LINES);
+$timings = json_decode((string) @file_get_contents($timingsFile), true);
+
+if ($listing === false || ! is_array($timings) || $shard < 1 || $shard > $shards) {
+    exit(1);
+}
+
+$classes = [];
+
+foreach ($listing as $line) {
+    if (preg_match('/^ - ([A-Za-z_\\\\][A-Za-z0-9_\\\\]*)::/', $line, $match) === 1) {
+        $classes[$match[1]] = true;
+    }
+}
+
+if ($classes === []) {
+    exit(1);
+}
+
+$known = [];
+
+foreach (array_keys($classes) as $class) {
+    if (isset($timings[$class]) && is_numeric($timings[$class])) {
+        $known[$class] = max(0.0, (float) $timings[$class]);
+    }
+}
+
+$sorted = array_values($known);
+sort($sorted);
+$count = count($sorted);
+$median = $count === 0 ? 1.0 : ($count % 2 === 1
+    ? $sorted[intdiv($count, 2)]
+    : ($sorted[$count / 2 - 1] + $sorted[$count / 2]) / 2);
+
+$weights = [];
+
+foreach (array_keys($classes) as $class) {
+    $weights[] = [$class, $known[$class] ?? $median];
+}
+
+// Slowest first; equal weights keep the listing order, so the plan is stable.
+usort($weights, static fn (array $a, array $b): int => $b[1] <=> $a[1]);
+
+$load = array_fill(0, $shards, 0.0);
+$plan = array_fill(0, $shards, []);
+
+foreach ($weights as [$class, $weight]) {
+    $target = array_keys($load, min($load))[0];
+    $load[$target] += $weight;
+    $plan[$target][] = preg_quote($class, '{');
+}
+
+// Every shard's filter is built and compiled, not only this one: PCRE refuses a pattern past its size limit
+// (two shards of a large suite), and PHPUnit would then silently run nothing. Every shard reaches the same
+// verdict, so they all fall back together.
+$filters = [];
+
+foreach ($plan as $classes) {
+    $filter = '{^(?:'.implode('|', $classes).')::}';
+
+    if ($classes === [] || @preg_match($filter, '') === false) {
+        exit(1);
+    }
+
+    $filters[] = $filter;
+}
+
+echo $filters[$shard - 1];
+PHP
+}
+
+# True when the stack holds its test shards to a coverage floor; the shard
+# then collects line coverage while it tests and reports it with the results.
+coverage_wanted() {
+    jq -e '.test.coverage != null' "$state/stack.json" >/dev/null
+}
+
+# Turns a Clover XML (PHPUnit) or LCOV (flutter test) coverage file into the
+# base64 of a gzipped {path: [executable ranges, covered ranges]}, paths
+# relative to the stack's directory, ranges like "1-5,8". The file came out of
+# the sandbox, so it is read as data only; a damaged file, or a map past the
+# server's limits, exits 1.
+coverage_lines() {
+    php -d memory_limit=1G -d display_errors=stderr -- "$1" "$2" "$3" <<'PHP'
+<?php
+
+[, $kind, $file, $prefix] = $argv;
+
+$lines = [];
+libxml_use_internal_errors(true);
+
+$relative = static fn (string $path): string => str_starts_with($path, $prefix)
+    ? substr($path, strlen($prefix))
+    : $path;
+
+if ($kind === 'clover') {
+    $reader = new XMLReader();
+
+    if (! $reader->open($file, null, LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING)) {
+        exit(1);
+    }
+
+    $current = null;
+
+    while ($reader->read()) {
+        if ($reader->nodeType !== XMLReader::ELEMENT) {
+            continue;
+        }
+
+        if ($reader->name === 'file') {
+            $current = $relative((string) $reader->getAttribute('name'));
+            $lines[$current] ??= [[], []];
+        } elseif ($reader->name === 'line' && $current !== null && $reader->getAttribute('type') === 'stmt') {
+            $number = (int) $reader->getAttribute('num');
+            $lines[$current][0][$number] = true;
+
+            if ((int) $reader->getAttribute('count') > 0) {
+                $lines[$current][1][$number] = true;
+            }
+        }
+    }
+
+    // A truncated or damaged file reads as a shorter one; it must count as no coverage, not as less.
+    if (libxml_get_errors() !== []) {
+        exit(1);
+    }
+} else {
+    $handle = fopen($file, 'r');
+    $current = null;
+
+    while (($line = fgets($handle)) !== false) {
+        $line = rtrim($line, "\r\n");
+
+        if (str_starts_with($line, 'SF:')) {
+            $current = $relative(substr($line, 3));
+            $lines[$current] ??= [[], []];
+        } elseif (str_starts_with($line, 'DA:') && $current !== null) {
+            [$number, $count] = array_map('intval', explode(',', substr($line, 3), 3) + [1 => 0]);
+            $lines[$current][0][$number] = true;
+
+            if ($count > 0) {
+                $lines[$current][1][$number] = true;
+            }
+        } elseif ($line === 'end_of_record') {
+            $current = null;
+        }
+    }
+
+    fclose($handle);
+}
+
+$ranges = static function (array $set): string {
+    $numbers = array_keys($set);
+    sort($numbers);
+    $parts = [];
+    $start = null;
+    $previous = null;
+
+    foreach ($numbers as $number) {
+        if ($number < 1) {
+            continue;
+        }
+
+        if ($start !== null && $number === $previous + 1) {
+            $previous = $number;
+
+            continue;
+        }
+
+        if ($start !== null) {
+            $parts[] = $start === $previous ? (string) $start : $start.'-'.$previous;
+        }
+
+        $start = $previous = $number;
+    }
+
+    if ($start !== null) {
+        $parts[] = $start === $previous ? (string) $start : $start.'-'.$previous;
+    }
+
+    return implode(',', $parts);
+};
+
+$coverage = [];
+
+foreach ($lines as $path => [$executable, $covered]) {
+    if ($executable === []) {
+        continue;
+    }
+
+    // The server's limits, checked here: a map it would refuse is no coverage at once, never a 422 that leaves
+    // the run waiting for results. Dropping the path instead would raise the figure.
+    if (preg_match('/^[^\x00-\x1f\x7f]{1,500}$/uD', $path) !== 1
+        || str_starts_with($path, '/')
+        || in_array('..', explode('/', $path), true)
+        || max(array_keys($executable)) > 999999) {
+        exit(1);
+    }
+
+    $coverage[$path] = [$ranges($executable), $ranges(array_intersect_key($covered, $executable))];
+
+    if (strlen($coverage[$path][0]) > 20000 || strlen($coverage[$path][1]) > 20000) {
+        exit(1);
+    }
+}
+
+if (count($coverage) > 10000) {
+    exit(1);
+}
+
+ksort($coverage);
+echo base64_encode(gzencode(
+    json_encode((object) $coverage, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+    9,
+));
+PHP
+}
+
+# Copies the shard's coverage file out of $out as uid 2000 and writes the
+# root-only coverage.gz.b64 build_payload sends. A missing, oversized or
+# unreadable file writes nothing, and the server then counts the shard's
+# coverage as missing.
+collect_coverage() {
+    local kind="$1"
+    local name="$2"
+    local copy="$state/coverage.$kind"
+    local prefix="$tree/"
+    local cap=268435456
+
+    rm -f "$state/coverage.gz.b64" "$copy"
+    if [ "$dir" != . ]; then
+        prefix="$tree/$dir/"
+    fi
+
+    if ! { [ -e "$out/$name" ] || [ -L "$out/$name" ]; } \
+        || ! ci-sandbox "$copy" "$out" -- head -c "$cap" "$name"; then
+        say 'the shard wrote no coverage'
+        return 0
+    fi
+
+    if [ "$(wc -c <"$copy")" -ge "$cap" ]; then
+        say 'the coverage file is too large to read'
+        return 0
+    fi
+
+    if ! coverage_lines "$kind" "$copy" "$prefix" >"$state/coverage.tmp" \
+        || ! [[ "$(cat "$state/coverage.tmp")" =~ ^[A-Za-z0-9+/]+=*$ ]]; then
+        say 'the coverage file could not be read or breaks the limits'
+        rm -f "$state/coverage.tmp"
+        return 0
+    fi
+    mv "$state/coverage.tmp" "$state/coverage.gz.b64"
+}
+# Summarises the first report a command left in CI_REPORT_DIR. The existence
+# test only stats the name; collect does the reading.
+collect_report() {
+    local report
+    local kind
+    local name
+
+    for report in junit:junit.xml pint:pint.json flutter:flutter.json; do
+        kind="${report%%:*}"
+        name="${report#*:}"
+
+        if [ -e "$out/$name" ] || [ -L "$out/$name" ]; then
+            collect "$kind" "$name"
+            return 0
+        fi
+    done
+}
+
+# Prints at most 2000 bytes of <log> without colour codes. A failing test's
+# name sits thousands of progress lines before the end of a long run, so when
+# the log has failure markers (a reporter's [E], FAIL or Expected: lines, else
+# error and exception lines) it prints each marker line and the three after
+# it, first markers first; otherwise its last 2000 bytes.
+failure_tail() {
+    local plain="$state/tail-source.txt"
+    local marked="$state/tail-marked.txt"
+
+    sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$1" >"$plain"
+
+    # The output goes to a file before it is cut: head closing a pipe early
+    # would fail awk with SIGPIPE under pipefail.
+    awk \
+        -v strong='\\[E\\]|FAIL|ERRORS!|EXCEPTION CAUGHT|Some tests failed|Expected:' \
+        -v weak='[Ee]rror|[Ee]xception|[Ff]ailed' '
+        NR == FNR {
+            if ($0 ~ strong) {
+                strongs[FNR] = 1
+            } else if ($0 ~ weak) {
+                weaks[FNR] = 1
+            }
+            next
+        }
+        FNR == 1 {
+            use_strong = length(strongs) > 0
+            until = 0
+            printed = 0
+        }
+        (use_strong && (FNR in strongs)) || (!use_strong && (FNR in weaks)) {
+            if (printed && FNR > printed + 1 && FNR > until) {
+                print "..."
+            }
+            until = FNR + 3
+        }
+        FNR <= until {
+            print
+            printed = FNR
+        }
+    ' "$plain" "$plain" >"$marked"
+
+    if [ -s "$marked" ]; then
+        head -c 2000 "$marked"
+    else
+        tail -c 2000 "$plain"
+    fi
+}
+
+# Fits the payload into 512 KB: the full caps first (200 failures, 2000
+# characters each, 500 annotations), then tighter ones, then counts only.
+build_payload() {
+    local tier
+    local max_failures
+    local max_message
+    local max_annotations
+    local with_coverage
+    local tail_file="$state/tail.txt"
+    local coverage_file="$state/coverage.gz.b64"
+
+    : >"$tail_file"
+    if [ ! -f "$coverage_file" ]; then
+        coverage_file="$state/no-coverage"
+        : >"$coverage_file"
+    fi
+    if [ -n "$last_log" ] && [ -f "$state/$last_log.log" ]; then
+        failure_tail "$state/$last_log.log" >"$tail_file"
+    fi
+
+    # Coverage is part of the verdict, so it outlasts the failures: every tier
+    # carries it but the last, and the server errors a run whose coverage is
+    # missing rather than passing it.
+    for tier in '200 2000 500 1' '50 500 100 1' '0 0 0 1' '0 0 0 0'; do
+        read -r max_failures max_message max_annotations with_coverage <<<"$tier"
+
+        jq -n \
+            --arg id "$CI_RUN_ID" \
+            --arg status "$status" \
+            --argjson duration "$SECONDS" \
+            --arg phase "$last_log" \
+            --arg reason "$failure_reason" \
+            --rawfile tail "$tail_file" \
+            --slurpfile summary "$state/summary.json" \
+            --rawfile coverage "$coverage_file" \
+            --argjson with_coverage "$with_coverage" \
+            --argjson max_failures "$max_failures" \
+            --argjson max_message "$max_message" \
+            --argjson max_annotations "$max_annotations" '
+            $summary[0] as $s
+            | (
+                if ($s.failures | length) == 0 and ($status == "failed" or $status == "errored") and ($tail | length) > 0
+                then [{file: "", line: 0, name: $phase, message: $tail}]
+                else $s.failures
+                end
+            ) as $failures
+            | {
+                ci_run_id: $id,
+                status: $status,
+                duration_s: $duration,
+                counts: $s.counts,
+                failures: ($failures[:$max_failures] | map(.message |= .[:$max_message])),
+                annotations: ($s.annotations[:$max_annotations] | map(.message |= .[:$max_message])),
+            }
+            # Evidence, never the verdict: the last tier drops them with the failures.
+            + (if $max_failures > 0 and ($s.slow_tests // [] | length) > 0
+                then {slow_tests: $s.slow_tests} else {} end)
+            + (if $max_failures > 0 and ($s.class_timings // {} | length) > 0
+                then {class_timings: $s.class_timings} else {} end)
+            + (if $max_failures > 0 and ($s.file_timings // {} | length) > 0
+                then {file_timings: $s.file_timings} else {} end)
+            + (if $with_coverage == 1 and ($coverage | length) > 0
+                then {coverage_gz: $coverage} else {} end)
+            + (if $reason == "" then {} else {reason: $reason} end)
+        ' >"$state/results.json"
+
+        if [ "$(wc -c <"$state/results.json")" -le 524288 ]; then
+            if [ "$with_coverage" = 0 ] && [ -s "$coverage_file" ]; then
+                say 'the coverage did not fit in 512 KB and was left out'
+            fi
+            return 0
+        fi
+    done
+
+    say 'results do not fit in 512 KB'
+    return 1
+}
+
+report() {
+    reporting=true
+    live_stop || true
+
+    if [ ! -f "$state/summary.json" ]; then
+        write_empty_summary
+    fi
+
+    # 1. Nothing from the pull request may be alive once a secret is in use.
+    if ! ci-sandbox --reap; then
+        say 'uid 2000 processes survived; results not sent'
+        exit 1
+    fi
+
+    # 2. Only now mint the results token.
+    build_payload
+    oidc_config "$results_audience" "$secret/results.curl"
+
+    if ! ci-post "$api/api/ci/results" "$secret/results.curl" "$state/results-response.json" "$state/results.json"; then
+        rm -f "$secret/results.curl"
+        say "results rejected (HTTP $(http_status "$state/results-response.json"))"
+        send_logs
+        exit 1
+    fi
+
+    rm -f "$secret/results.curl"
+    say 'results sent'
+    send_logs
+}
+
+# Uploads the logs when the token response turned log_upload on. A failed
+# upload is one public line: the results decide the job, never the logs.
+send_logs() {
+    if [ "$log_upload" != true ]; then
+        return 0
+    fi
+
+    if upload_logs; then
+        say 'logs sent'
+    else
+        say "logs not sent (HTTP $(http_status "$state/logs-response.json"))"
+    fi
+}
+
+# Every root-only log of this container, oldest first, each under an
+# `== <phase> ==` heading, with every value in $secret/redact (the token, its
+# Basic form, the ticket, the cache namespace) replaced line by line, then
+# gzipped. The Worker refuses a body over 8 MiB, so the tail is cut tighter
+# until it fits; the last cut is small enough for any content. Called only
+# as an `if` condition, where errexit is off, so every step checks itself.
+upload_logs() {
+    local text="$state/logs.txt"
+    local body="$state/logs.gz"
+    local log
+    local cap
+    local fits=false
+
+    rm -f "$state/logs-response.json.status"
+
+    # 1. One redacted text. The names are ci-job's own fixed log names.
+    if ! ls -1tr "$state"/*.log >"$state/logs.list"; then
+        return 1
+    fi
+    if ! while IFS= read -r log; do
+        printf '== %s ==\n' "$(basename "$log" .log)"
+        cat "$log"
+    done <"$state/logs.list" | ci-live --redact "$secret/redact" >"$text"; then
+        return 1
+    fi
+
+    # 2. The tail that fits in 8 MiB once gzipped.
+    for cap in 67108864 33554432 16777216 8323072; do
+        if ! tail -c "$cap" "$text" | gzip -c >"$body"; then
+            return 1
+        fi
+        if [ "$(wc -c <"$body")" -le 8388608 ]; then
+            fits=true
+            break
+        fi
+    done
+    if [ "$fits" != true ]; then
+        return 1
+    fi
+
+    # 3. A fresh results-audience token; the server takes it once for logs.
+    if ! oidc_config "$results_audience" "$secret/logs.curl"; then
+        return 1
+    fi
+    if ! ci-post -z "$api/api/ci/logs" "$secret/logs.curl" "$state/logs-response.json" "$body"; then
+        rm -f "$secret/logs.curl"
+        return 1
+    fi
+    rm -f "$secret/logs.curl"
+}
+
+on_error() {
+    trap - ERR
+
+    # errtrace hands this trap to command substitutions too; only the main
+    # shell reports, or one failure would post twice.
+    if [ "$BASHPID" != "$$" ]; then
+        exit 1
+    fi
+
+    say "internal error at line $1"
+
+    if [ "$reporting" = true ]; then
+        exit 1
+    fi
+
+    # A deploy job holds no installation token and runs no test: once its row is Running a failure closes it as
+    # errored (status only), and before that there is nothing the server could take.
+    if [ "$deploying" = true ]; then
+        if [ "$deploy_certified" = true ]; then
+            report_deploy errored
+        fi
+
+        exit 1
+    fi
+
+    # A build posts only its own body, and only once its row is Running.
+    if [ "$building" = true ]; then
+        if [ "$build_started" = true ]; then
+            build_note="internal error at line $1"
+            abandon_build
+        fi
+
+        exit 1
+    fi
+
+    if [ -f "$secret/github.curl" ]; then
+        revoke_token
+    fi
+
+    status=errored
+    report
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# prepare
+# ---------------------------------------------------------------------------
+
+exchange_token() {
+    local repository
+
+    oidc_config "$token_audience" "$secret/oidc-token.curl"
+    jq -n --arg id "$CI_RUN_ID" '{ci_run_id: $id}' >"$state/token-request.json"
+
+    if ! ci-post "$api/api/ci/token" "$secret/oidc-token.curl" "$secret/token.json" "$state/token-request.json"; then
+        rm -f "$secret/oidc-token.curl"
+        say "token exchange failed (HTTP $(http_status "$secret/token.json"))"
+        # A rate limit, a server error or no answer is the edge or a deploy
+        # in flight; a 4xx is the server refusing this job, which a retry
+        # would not change.
+        case "$(http_status "$secret/token.json")" in
+            000 | 429 | 5??) failure_reason=transient ;;
+        esac
+        return 1
+    fi
+    rm -f "$secret/oidc-token.curl"
+
+    # Every value below lands in a path, a URL, a curl config or a sandboxed
+    # shell, so its shape is checked before use. The token allows dots and
+    # dashes: GitHub's stateless installation tokens carry a JWT after the
+    # ghs_ prefix. The manifest is the repository's own file, relayed by
+    # the server, so it is checked here too. Only the names of failing fields
+    # reach the public log, never a value.
+    local bad
+    bad="$(jq -r '
+        def relative_path:
+            type == "string"
+            and test("^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$")
+            and (split("/") | all(. != "." and . != ".."));
+        def shell_text: type == "string" and length > 0 and all(explode[]; . != 0);
+        def commands: type == "array" and all(.[]; shell_text);
+        def optional(check): . == null or check;
+        def proxied: [.features | objects | .git_proxy == true] | any;
+        def laravel_block:
+            (.dir == "." or (.dir | relative_path))
+            and (.setup | commands)
+            and (.lint | commands)
+            and (.aux | optional(commands))
+            and (.services | optional(type == "array" and all(.[]; . == "postgres")))
+            and (.scope_script | optional(relative_path))
+            and (.test | type == "object")
+            and (.test.shards | type == "number" and . >= 1 and . <= 8 and . == floor)
+            and (.test.filter_script | optional(relative_path));
+        def flutter_block:
+            (.dir == "." or (.dir | relative_path))
+            and (.setup | commands)
+            and (.lint | commands)
+            and (.test | type == "object")
+            and (.test.shards | type == "number" and . >= 1 and . <= 8 and . == floor)
+            and (.test.command | optional(shell_text));
+        # A declared job is unsharded and names its stack outright; its steps
+        # and number exist on no other role, so a stray one is refused.
+        . as $r
+        | ($r.role == "job") as $job
+        | [
+            (if (.token | type == "string" and test("^[A-Za-z0-9._-]+$")) then empty else "token" end),
+            (if (.repository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) then empty else "repository" end),
+            (if (.head_sha | type == "string" and test("^[0-9a-f]{40}$")) then empty else "head_sha" end),
+            (if (.base_sha == null or (.base_sha | type == "string" and test("^([0-9a-f]{40})?$"))) then empty else "base_sha" end),
+            (if (.merge_base_sha == null or (.merge_base_sha | type == "string" and test("^[0-9a-f]{40}$")))
+                then empty else "merge_base_sha" end),
+            (if (.mode | IN("pr", "main")) then empty else "mode" end),
+            (if (.role | IN("lint", "aux", "warm", "test", "flutter-lint", "flutter-warm", "flutter-test", "job"))
+                then empty else "role" end),
+            (if (.shards | type == "number" and . >= 1 and . == floor) then empty else "shards" end),
+            (if $job then (if .shard == 0 then empty else "shard" end)
+                elif (.shard | type == "number" and . >= 1 and . == floor and . <= ($r.shards // 0)) then empty
+                else "shard" end),
+            (if (.stack | IN("laravel", "flutter"))
+                and ($job or ((.role | tostring | startswith("flutter-")) == (.stack == "flutter")))
+                then empty else "stack" end),
+            (if $job then (if .steps | commands and length >= 1 and length <= 20 then empty else "steps" end)
+                elif has("steps") then "steps" else empty end),
+            (if $job then (if .job_index | type == "number" and . >= 1 and . <= 20 and . == floor
+                then empty else "job_index" end)
+                elif has("job_index") then "job_index" else empty end),
+            (if (.cache_namespace | type == "string" and test("^[0-9a-f]{16}$")) then empty else "cache_namespace" end),
+            (if (.features | optional(type == "object" and all(.[]; type == "boolean"))) then empty else "features" end),
+            (if (proxied | not) or (.git_ticket | type == "string" and test("^v1\\.[A-Za-z0-9_-]+\\.[0-9a-f]{64}$"))
+                then empty else "git_ticket" end),
+            (if (try (
+                (.manifest | type == "object")
+                and .manifest.version == 1
+                and (.manifest.stacks | type == "object")
+                and (.manifest.stacks | keys) == [$r.stack]
+                and (.manifest.stacks[$r.stack] | if $r.stack == "laravel" then laravel_block else flutter_block end)
+            ) catch false) then empty else "manifest" end)
+        ] | join(",")
+    ' "$secret/token.json")"
+
+    if [ -n "$bad" ]; then
+        say "the token response has an unexpected shape ($bad)"
+        return 1
+    fi
+
+    # The last passed run's class timings, for the shard plan; a malformed entry is dropped, never trusted.
+    jq '
+        .class_timings // {}
+        | if type == "object" then . else {} end
+        | with_entries(select(
+            (.key | test("^[A-Za-z_\\\\][A-Za-z0-9_\\\\]{0,254}$"))
+            and (.value | type == "number" and . >= 0)
+        ))
+    ' "$secret/token.json" >"$state/class-timings.json"
+
+    store_source_token
+
+    # Owner rows send no features, which keeps it off.
+    log_upload="$(jq -r '.features.log_upload == true' "$secret/token.json")"
+
+    # Live progress needs both tickets in a shape a curl config line can carry.
+    # Anything else drops it without a word: live progress is never a reason
+    # to fail, nor to name a field on the public log. The tickets are copied
+    # now, because the revocation deletes the response.
+    live="$(jq -r '
+        def ticket: type == "string" and test("^[A-Za-z0-9._~+/=-]{1,4096}$");
+        .live | type == "object" and (.events_ticket | ticket) and (.chunk_ticket | ticket)
+    ' "$secret/token.json")"
+
+    if [ "$live" = true ]; then
+        jq -j '.live.events_ticket' "$secret/token.json" >"$secret/live-events-ticket"
+        jq -j '.live.chunk_ticket' "$secret/token.json" >"$secret/live-chunk-ticket"
+        install -d -m 0700 "$state/live"
+        : >"$state/live/events.ndjson"
+        : >"$state/live/order"
+    fi
+
+    # What upload_logs and ci-live replace; written now because run, a later
+    # step, never sees the token response.
+    if [ "$log_upload" = true ] || [ "$live" = true ]; then
+        {
+            jq -r '.token, (.git_ticket // empty), .cache_namespace' "$secret/token.json"
+            if [ "$live" = true ]; then
+                jq -r '.live.events_ticket, .live.chunk_ticket' "$secret/token.json"
+            fi
+            basic_auth
+            echo
+        } >"$secret/redact"
+    fi
+
+    # The stack's manifest block is all run needs of the manifest; it stays
+    # root-only beside the logs. A job's steps join it under `job`, the list
+    # run_commands reads.
+    jq '.manifest.stacks[.stack] + (if .role == "job" then {job: .steps} else {} end)' \
+        "$secret/token.json" >"$state/stack.json"
+
+    mode="$(jq -r '.mode' "$secret/token.json")"
+    role="$(jq -r '.role' "$secret/token.json")"
+    stack="$(jq -r '.stack' "$secret/token.json")"
+    shard="$(jq -r '.shard' "$secret/token.json")"
+    shards="$(jq -r '.shards' "$secret/token.json")"
+    head_sha="$(jq -r '.head_sha' "$secret/token.json")"
+    base_sha="$(jq -r '.base_sha // ""' "$secret/token.json")"
+    merge_base_sha="$(jq -r '.merge_base_sha // ""' "$secret/token.json")"
+    cache_namespace="$(jq -r '.cache_namespace' "$secret/token.json")"
+    dir="$(jq -r '.dir' "$state/stack.json")"
+    repository="$(jq -r '.repository' "$secret/token.json")"
+
+    # The server resolves the job from its check_run_id; a role or shard that
+    # disagrees with this job's name means the two sides are out of step.
+    if [ "$role" != "${CI_JOB_NAME%% (*}" ]; then
+        say 'the token response names another role than this job'
+        return 1
+    fi
+    # A job is unsharded: its name's number is the job_index, and it must have one.
+    if [ "$role" = job ]; then
+        if ! [[ "$CI_JOB_NAME" =~ ^job\ \(([1-9][0-9]?)\)$ ]] \
+            || [ "${BASH_REMATCH[1]}" != "$(jq -r '.job_index' "$secret/token.json")" ]; then
+            say 'the token response names another job number than this job'
+            return 1
+        fi
+    elif [[ "$CI_JOB_NAME" =~ \(([0-9]+)\)$ ]] && [ "${BASH_REMATCH[1]}" != "$shard" ]; then
+        say 'the token response names another shard than this job'
+        return 1
+    fi
+
+    init_checkout "$repository"
+}
+
+# Writes $secret/github.curl, the GitHub API config revoke_token reads, from the answer's token alone. The token
+# must already have passed its shape check: it lands inside a quoted curl header.
+write_github_curl() {
+    jq -r '
+        "header = \"Authorization: Bearer \(.token)\"",
+        "header = \"Accept: application/vnd.github+json\"",
+        "header = \"X-GitHub-Api-Version: 2022-11-28\""
+    ' "$secret/token.json" >"$secret/github.curl"
+}
+
+# Writes the installation token of a checked token response to the 0600 files
+# fetch_source and revoke_token read, with the Worker's git ticket when the
+# response turns features.git_proxy on (owner rows send no features, which
+# keeps it off).
+store_source_token() {
+    jq -j '.token' "$secret/token.json" >"$secret/github-token"
+    write_github_curl
+
+    git_proxy="$(jq -r '.features.git_proxy == true' "$secret/token.json")"
+
+    if [ "$git_proxy" = true ]; then
+        jq -j '.git_ticket' "$secret/token.json" >"$secret/git-ticket"
+        jq -r '"header = \"X-Ci-Ticket: \(.git_ticket)\""' "$secret/token.json" >>"$secret/github.curl"
+    fi
+}
+
+# usage: init_checkout <repository>
+# The URL is written by printf, a builtin, so the repository name never
+# becomes an argument of a git command. Through the Worker the URL names no
+# repository at all: the ticket does.
+init_checkout() {
+    git init --quiet "$tree"
+    if [ "$git_proxy" = true ]; then
+        printf '[remote "origin"]\n\turl = %s/git\n' "$api" >>"$tree/.git/config"
+    else
+        printf '[remote "origin"]\n\turl = https://github.com/%s.git\n' "$1" >>"$tree/.git/config"
+    fi
+}
+
+# The installation token as the Basic credential GitHub's git endpoint takes.
+basic_auth() {
+    printf 'x-access-token:%s' "$(cat "$secret/github-token")" | base64 | tr -d '\n'
+}
+
+# git asks GIT_ASKPASS for the password; the helper reads the token from the
+# 0600 file named in its environment, and credential.helper is emptied so no
+# helper stores it. Through the Worker the ticket and the Basic credential are
+# http.extraHeader values in git's environment instead, which no other account
+# can read and which never reach argv or the remote URL.
+git_with_token() {
+    if [ "$git_proxy" = true ]; then
+        GIT_CONFIG_COUNT=2 \
+            GIT_CONFIG_KEY_0=http.extraHeader \
+            GIT_CONFIG_VALUE_0="X-Ci-Ticket: $(cat "$secret/git-ticket")" \
+            GIT_CONFIG_KEY_1=http.extraHeader \
+            GIT_CONFIG_VALUE_1="Authorization: Basic $(basic_auth)" \
+            GIT_TERMINAL_PROMPT=0 \
+            git -C "$tree" -c credential.helper= "$@"
+    else
+        GIT_ASKPASS="$secret/askpass" \
+            CI_GIT_TOKEN_FILE="$secret/github-token" \
+            GIT_TERMINAL_PROMPT=0 \
+            git -C "$tree" -c credential.helper= "$@"
+    fi
+}
+
+# One commit at depth 1. GitHub refuses a burst of shard fetches now and then
+# with a 429 that can outlast 15 s, and the edge a 5xx; five tries over about
+# two minutes (10, 20, 40, 60 s plus jitter) outlast it, and a refusal that
+# lasts still fails the job.
+fetch_commit() {
+    local try
+    local pause="$CI_FETCH_BACKOFF_SECONDS"
+
+    for try in 1 2 3 4 5; do
+        if git_with_token fetch --quiet --no-tags --depth=1 origin "$1"; then
+            return 0
+        fi
+        if [ "$try" -lt 5 ]; then
+            sleep "$((pause + RANDOM % (CI_FETCH_JITTER_SECONDS + 1)))"
+            pause=$((pause * 2 > 60 ? 60 : pause * 2))
+        fi
+    done
+
+    return 1
+}
+
+fetch_source() {
+    if [ "$git_proxy" != true ]; then
+        cat >"$secret/askpass" <<'SH'
+#!/bin/sh
+case "$1" in
+    Username*) echo x-access-token ;;
+    *) cat "$CI_GIT_TOKEN_FILE" ;;
+esac
+SH
+        chmod 0700 "$secret/askpass"
+    fi
+
+    # Every lost head fetch counts as transient, a gone commit or a refused
+    # token too: git prints only the status, and a wrong guess costs at most
+    # the server's two retries.
+    if ! fetch_commit "$head_sha"; then
+        say 'fetching the head commit failed'
+        failure_reason=transient
+        return 1
+    fi
+    git -C "$tree" -c advice.detachedHead=false checkout --quiet --detach FETCH_HEAD
+
+    # The scope script diffs two trees, so it needs the base too; without one
+    # it runs everything, the same as ci.yml.
+    if [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] && [[ ! "$base_sha" =~ ^0+$ ]] && [ "$base_sha" != "$head_sha" ]; then
+        if ! fetch_commit "$base_sha"; then
+            base_sha=''
+        fi
+    fi
+
+    fetch_merge_base
+}
+
+# The scope diffs against the merge base when the server sent one; it is
+# often the base tip itself, already here. One that cannot be fetched is
+# dropped and the base tip stands in, which only widens the scope.
+fetch_merge_base() {
+    if [[ "$merge_base_sha" =~ ^[0-9a-f]{40}$ ]] \
+        && ! git -C "$tree" cat-file -e "$merge_base_sha^{commit}" 2>/dev/null \
+        && ! fetch_commit "$merge_base_sha"; then
+        merge_base_sha=''
+    fi
+}
+
+# The commit the scope script diffs the head against: the pull request's merge
+# base when there is one, so changes the base gained after the branch forked
+# are not counted as the pull request's own; otherwise the base tip.
+scope_base() {
+    if [[ "$merge_base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+        printf '%s' "$merge_base_sha"
+    else
+        printf '%s' "$base_sha"
+    fi
+}
+
+scope_value() {
+    awk -v key="$1=" 'index($0, key) == 1 { value = substr($0, length(key) + 1) } END { print value }' \
+        "$state/scope.log"
+}
+
+# In pr mode the head commit is the pull request's own code, so its scope
+# script could skip every test. Root copies the base commit's version to a
+# root-owned file uid 2000 can read, while root still owns .git (git refuses a
+# repository another account owns) and before any repository code has run.
+# Stages nothing in main mode, without a fetched base, or when the base has
+# no such script; decide_scope then runs everything.
+stage_scope_script() {
+    local scope_script
+
+    rm -f "$scope_file"
+
+    scope_script="$(jq -r '.scope_script // ""' "$state/stack.json")"
+    if [ "$mode" != pr ] || [ "$stack" != laravel ] || [ -z "$scope_script" ]; then
+        return 0
+    fi
+    if ! [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || [[ "$base_sha" =~ ^0+$ ]]; then
+        return 0
+    fi
+
+    if ! git -C "$tree" cat-file blob "$base_sha:$scope_script" >"$scope_file"; then
+        rm -f "$scope_file"
+        return 0
+    fi
+    chmod 0644 "$scope_file"
+}
+
+# Without a scope script everything runs: php full, aux on, every file linted.
+# The script path is relative to the repository root, not to the manifest's
+# directory, the same place a repository's own scope script has always run from. Main
+# mode runs the head's script (the default branch is trusted); pr mode runs
+# the copy stage_scope_script made, against the head tree.
+decide_scope() {
+    local scope_script
+    local scope_command
+
+    scoped=false
+    gateway=true
+    php=full
+    filter=''
+    pint_base=''
+
+    scope_script="$(jq -r '.scope_script // ""' "$state/stack.json")"
+    if [ "$stack" != laravel ] || [ -z "$scope_script" ]; then
+        return 0
+    fi
+    scoped=true
+
+    if [ "$mode" = main ]; then
+        scope_command=(bash "./$scope_script")
+    elif [ -f "$scope_file" ]; then
+        scope_command=(bash "$scope_file")
+    else
+        say 'no scope script on the base commit; everything runs'
+        return 0
+    fi
+
+    if ! sandboxed scope "$tree" -- "${scope_command[@]}" "$(scope_base)" "$head_sha" "$mode"; then
+        say 'the scope script failed'
+        return 1
+    fi
+
+    gateway="$(scope_value gateway)"
+    php="$(scope_value php)"
+    filter="$(scope_value filter)"
+    pint_base="$(scope_value pint_base)"
+
+    # The script reads the head tree (pull request code), so its answer is
+    # untrusted.
+    if ! [[ "$gateway" =~ ^(true|false)$ ]] \
+        || ! [[ "$php" =~ ^(none|docs|affected|full)$ ]] \
+        || ! [[ "$filter" =~ ^[A-Za-z0-9_|]*$ ]] \
+        || ! [[ "$pint_base" =~ ^([0-9a-f]{40})?$ ]]; then
+        say 'the scope script gave an unusable answer'
+        return 1
+    fi
+
+    if [ -z "$pint_base" ]; then
+        return 0
+    fi
+
+    # Files added, copied, modified or renamed since pint_base; the manifest's
+    # lint commands pick their own languages and exclusions from the list. Its
+    # log is the list, so git's stderr stays out of it.
+    if ! sandboxed changed-files "$tree" -- \
+        sh -c "exec git -c core.quotePath=false diff --name-only --diff-filter=ACMR \"\$1\" HEAD 2>/dev/null" \
+        ci-diff "$pint_base"; then
+        say 'listing the changed files failed'
+        return 1
+    fi
+}
+
+# Lock file contents under the manifest's directory: ci.yml restores the cache
+# under `ci-<namespace>-<stack>-<hash>` and falls back to the newest entry of
+# the same namespace and stack, so one repository never restores another's.
+cache_key() {
+    local workdir="$1"
+    local lock_files=(
+        composer.lock
+        package-lock.json
+    )
+    local file
+    local hash
+
+    if [ "$stack" = flutter ]; then
+        lock_files=(
+            pubspec.lock
+        )
+    fi
+
+    hash="$(
+        for file in "${lock_files[@]}"; do
+            if [ -f "$workdir/$file" ] && [ ! -L "$workdir/$file" ]; then
+                cat "$workdir/$file"
+            fi
+        done | sha256sum | cut -d' ' -f1
+    )"
+
+    # Salted so two namespaces never share a key suffix: an equal lock file
+    # would otherwise link two hosts' caches in the public cache listing.
+    hash="$(printf '%s|%s' "$cache_namespace" "$hash" | sha256sum | cut -d' ' -f1)"
+
+    printf '%s-%s-%s\n' "$cache_namespace" "$stack" "$hash"
+}
+
+prepare() {
+    # The pool's 20 minute limit started before this step (container init),
+    # so a job's ceiling counts from here, not from run.
+    prepare_started="$(date +%s)"
+    local workdir
+    local key
+
+    say 'prepare'
+
+    # 1. Nothing may be running as uid 2000 while the tokens exist.
+    ci-sandbox --reap
+
+    # 2. Facts, manifest and token, then the source, then the token is gone.
+    exchange_token
+    fetch_source
+    revoke_token
+    say "mode=$mode"
+
+    # 3. Root resolves the manifest's directory, hashes the lock files and
+    #    stages the base commit's scope script before any repository code has
+    #    run.
+    if ! workdir="$(resolve_dir "$tree" "$dir")"; then
+        say 'the manifest directory is not usable'
+        return 1
+    fi
+    key="$(cache_key "$workdir")"
+    stage_scope_script
+
+    # 4. The repository's own scope rules run as uid 2000, after revocation.
+    #    -h: a symlink in the checkout is re-owned itself, never its target.
+    chown -R -h "$sandbox_uid:$sandbox_uid" "$tree"
+    decide_scope
+    rm -rf "$tree/.git"
+
+    jq -n \
+        --arg mode "$mode" \
+        --arg role "$role" \
+        --arg stack "$stack" \
+        --argjson shard "$shard" \
+        --argjson shards "$shards" \
+        --argjson scoped "$scoped" \
+        --arg gateway "$gateway" \
+        --arg php "$php" \
+        --arg filter "$filter" \
+        --arg pint_base "$pint_base" \
+        --argjson log_upload "$log_upload" \
+        --argjson live "$live" \
+        --argjson prepare_started "$prepare_started" \
+        '{
+            mode: $mode,
+            role: $role,
+            stack: $stack,
+            shard: $shard,
+            shards: $shards,
+            scoped: $scoped,
+            gateway: $gateway,
+            php: $php,
+            filter: $filter,
+            pint_base: $pint_base,
+            prepare_started: $prepare_started,
+        } + (if $log_upload then {log_upload: true} else {} end)
+          + (if $live then {live: true} else {} end)' \
+        >"$state/job.json"
+
+    # 5. actions/cache needs the namespace for the key, and logs the key it
+    #    restores; masked first, so the public log shows *** in its place.
+    printf '::add-mask::%s\n' "$cache_namespace" "$key" >&3
+    printf 'cache_key=%s\ncache_scope=%s-%s\nmode=%s\n' "$key" "$cache_namespace" "$stack" "$mode" \
+        >>"${GITHUB_OUTPUT:?}"
+    live_event status prepare || true
+    say 'prepared'
+}
+
+# ---------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------
+
+# usage: stack_sandboxed [--postgres] <log-name> [NAME=VALUE ...] -- <command> [arg ...]
+# Resolves the manifest's directory again before every call: the previous
+# command (uid 2000, reaped since, so nothing races this check) may have
+# swapped one of its components for a symlink.
+stack_sandboxed() {
+    local flags=()
+    local workdir
+
+    if [ "$1" = --postgres ]; then
+        flags=(--postgres)
+        shift
+    fi
+
+    if ! workdir="$(resolve_dir "$tree" "$dir")"; then
+        say 'the manifest directory is not usable'
+        on_error "$LINENO"
+    fi
+
+    sandboxed "${flags[@]}" "$1" "$workdir" "${@:2}"
+}
+
+# usage: run_commands <phase> <manifest-key>
+# Runs the manifest's list under <manifest-key> one by one, each as `bash -c`
+# in the manifest's directory. Fails at the first that fails.
+run_commands() {
+    local phase="$1"
+    local key="$2"
+    local count
+    local index
+    local command
+
+    # Callers test this function, which switches errexit off in here; a jq
+    # failure must not read as an empty, passing list.
+    count="$(jq --arg key "$key" '.[$key] // [] | length' "$state/stack.json")" || on_error "$LINENO"
+
+    for ((index = 0; index < count; index++)); do
+        command="$(jq -r --arg key "$key" --argjson index "$index" '.[$key][$index]' "$state/stack.json")" \
+            || on_error "$LINENO"
+
+        if ! stack_sandboxed "$phase-$((index + 1))" -- bash -c "$command"; then
+            return 1
+        fi
+    done
+}
+
+composer_install() {
+    stack_sandboxed install BROADCAST_CONNECTION=log -- \
+        composer install --no-interaction --no-progress --prefer-dist "$@"
+}
+
+# Composer first (with the given flags), then the manifest's setup list.
+laravel_setup() {
+    say 'install'
+    if ! composer_install "$@"; then
+        return 1
+    fi
+
+    say 'setup'
+    run_commands setup setup
+}
+
+run_lint() {
+    if [ "$php" != affected ] && [ "$php" != full ]; then
+        status=skipped
+        return 0
+    fi
+
+    if ! laravel_setup --no-scripts; then
+        status=errored
+        return 0
+    fi
+
+    say 'lint'
+    if run_commands lint lint; then
+        status=passed
+    else
+        status=failed
+    fi
+
+    collect_report
+}
+
+# A declared job: the server's steps in order as job-1..job-N, each under
+# what is left of CI_JOB_CEILING_SECONDS since prepare. ci-sandbox passes a
+# step's own status through, so a 124 or 137 is the ceiling only once the
+# clock says so; otherwise it is the step's own (its own timeout, an OOM kill)
+# and fails the job like any other code. A step cut at the ceiling is errored,
+# and its uid 2000 tree is reaped at once: timeout's TERM killed ci-sandbox
+# before its own reap.
+run_job() {
+    local job_deadline
+    local count
+
+    # 1. run_commands reads a missing list as zero steps that all passed.
+    count="$(jq '.job // [] | length' "$state/stack.json")" || on_error "$LINENO"
+    if [ "$count" -lt 1 ]; then
+        say 'the job has no steps'
+        status=errored
+        return 0
+    fi
+
+    # 2. The steps, under the deadline sandboxed reads.
+    job_deadline=$((prepare_started + CI_JOB_CEILING_SECONDS))
+    step_code=0
+    step_not_started=false
+
+    say 'job'
+    if run_commands job job; then
+        status=passed
+    elif [ "$step_not_started" = true ]; then
+        say 'job: out of time before the next step'
+        status=errored
+    elif { [ "$step_code" = 124 ] || [ "$step_code" = 137 ]; } && [ "$(date +%s)" -ge "$job_deadline" ]; then
+        say 'job: out of time'
+        status=errored
+        ci-sandbox --reap
+    else
+        status=failed
+    fi
+    job_deadline=''
+
+    # 3. Only a reaped tree's report is read.
+    collect_report
+}
+
+run_aux() {
+    if [ "$gateway" != true ]; then
+        status=skipped
+        return 0
+    fi
+
+    if ! laravel_setup --no-scripts; then
+        status=errored
+        return 0
+    fi
+
+    say 'aux'
+    if run_commands aux aux; then
+        status=passed
+    else
+        status=failed
+    fi
+
+    collect_report
+}
+
+run_warm() {
+    if [ "$mode" != main ]; then
+        status=skipped
+        return 0
+    fi
+
+    say 'warm'
+    if composer_install --no-scripts --no-plugins; then
+        status=passed
+    else
+        status=failed
+    fi
+}
+
+# Sets shard_args to this shard's selection and shard_mode to how it was
+# chosen. Every shard of a run must pick the same partition, or a class could
+# run nowhere:
+#   - this shard's listing failed: the whole suite (shard_mode whole), because
+#     the other shards may have planned, and a repeated test is cheaper than a
+#     skipped one;
+#   - a listing: plan_shard deals the listed classes by duration, or, when the
+#     token carried no class timings, by count (every class weighs the same).
+#     It decides from data every shard shares, so a refusal (a filter too large
+#     to compile, too few classes) is the same on every shard and they all take
+#     paratest's sequential split together.
+# Never paratest's round-robin split: it deals test methods but hands its
+# workers whole files, so nearly every class lands on every shard and each
+# shard runs about the whole suite. The sequential split slices the same method
+# list into contiguous runs, so a shard repeats at most the class it starts in
+# and the class it ends in.
+# The listing runs repository code, so it runs sandboxed; it is planning
+# input, not evidence, so it never reaches the uploaded logs.
+shard_split() {
+    local filter
+    local timings="$state/class-timings.json"
+    local basis='by duration'
+
+    shard_args=("--shard=$shard/$shards" --shard-test-distribution=sequential)
+    shard_mode=sequential
+
+    if [ "$(jq 'length' "$timings" 2>/dev/null || echo 0)" -eq 0 ]; then
+        timings="$state/no-class-timings.json"
+        basis='by class count'
+        printf '{}' >"$timings"
+    fi
+
+    if ! stack_sandboxed list-tests -- php vendor/bin/phpunit --list-tests; then
+        shard_args=()
+        shard_mode=whole
+        say 'shards: the listing failed, this shard runs the whole suite'
+    elif filter="$(plan_shard "$state/list-tests.log" "$timings" "$shard" "$shards")"; then
+        shard_args=(--filter "$filter")
+        shard_mode=planned
+        say "shards: ${basis}"
+    else
+        say 'shards: sequential'
+    fi
+
+    rm -f "$state/list-tests.log"
+}
+
+run_test() {
+    local flags=()
+    local args=(
+        artisan
+        test
+    )
+
+    case "$php" in
+        none)
+            status=skipped
+            return 0
+            ;;
+        docs)
+            # ci.yml runs only the rule-file check here, once.
+            if [ "$shard" -ne 1 ]; then
+                status=skipped
+                return 0
+            fi
+            args+=(--compact --filter RuleFileClassReferencesTest)
+            ;;
+        affected)
+            # A filtered run is small, and split across shards most shards
+            # match nothing, which PHPUnit exits 1 on. Shard 1 runs it whole.
+            if [ "$shard" -ne 1 ]; then
+                status=skipped
+                return 0
+            fi
+            args=(artisan test --parallel --processes=4 --compact --filter "$filter")
+            ;;
+        full)
+            args=(artisan test --parallel --processes=4 --compact)
+            ;;
+    esac
+
+    if jq -e '(.services // []) | index("postgres")' "$state/stack.json" >/dev/null; then
+        flags=(--postgres)
+    fi
+
+    if ! laravel_setup --optimize-autoloader; then
+        status=errored
+        return 0
+    fi
+
+    shard_mode=''
+    if [ "$php" = full ] && [ "$shards" -gt 1 ]; then
+        shard_split
+        args+=("${shard_args[@]}")
+    fi
+    args+=(--log-junit "$out/junit.xml")
+
+    # A narrowed run (docs, affected) covers a sliver of the code, so only a
+    # full run measures coverage.
+    local coverage=false
+    if [ "$php" = full ] && coverage_wanted; then
+        coverage=true
+        args+=(--coverage-clover "$out/coverage.xml")
+    fi
+
+    say 'test'
+    if stack_sandboxed "${flags[@]}" test -- php "${args[@]}"; then
+        status=passed
+    else
+        status=failed
+    fi
+
+    collect_report
+    if [ "$coverage" = true ]; then
+        collect_coverage clover coverage.xml
+    fi
+
+    # PHPUnit passes an empty selection, so a planned shard that ran nothing would read green with its
+    # classes untested.
+    if [ "$shard_mode" = planned ] && [ "$status" = passed ] \
+        && [ "$(jq '.counts.tests // 0' "$state/summary.json")" -eq 0 ]; then
+        say 'the planned shard ran no test'
+        status=errored
+    fi
+}
+
+run_flutter_lint() {
+    say 'setup'
+    if ! run_commands setup setup; then
+        status=errored
+        return 0
+    fi
+
+    say 'lint'
+    if run_commands lint lint; then
+        status=passed
+    else
+        status=failed
+    fi
+
+    collect_report
+}
+
+run_flutter_warm() {
+    if [ "$mode" != main ]; then
+        status=skipped
+        return 0
+    fi
+
+    say 'warm'
+    if stack_sandboxed install -- flutter pub get; then
+        status=passed
+    else
+        status=failed
+    fi
+}
+
+# Prints the manifest's test command, or the default. Both expand inside the
+# sandbox, from the CI_* environment. An override that runs `flutter test`
+# without --file-reporter leaves collect_report nothing to read (every count
+# 0, no test name), so the JSON reporter goes in right after `flutter test`.
+flutter_test_command() {
+    local command
+    local reporter='--file-reporter "json:$CI_REPORT_DIR/flutter.json"'
+    local coverage='--coverage --coverage-path "$CI_REPORT_DIR/lcov.info"'
+
+    command="$(jq -r '.test.command // empty' "$state/stack.json")"
+    if [ -z "$command" ]; then
+        command='flutter test --total-shards "$CI_SHARDS" --shard-index "$((CI_SHARD - 1))" --file-reporter "json:$CI_REPORT_DIR/flutter.json"'
+    fi
+
+    if [[ "$command" == *'flutter test'* ]] && [[ "$command" != *--file-reporter* ]]; then
+        command="${command/flutter test/flutter test $reporter}"
+    fi
+    # With a coverage floor the shard collects coverage where collect_coverage
+    # reads it, whatever the command says.
+    if coverage_wanted && [[ "$command" == *'flutter test'* ]]; then
+        command="${command/flutter test/flutter test $coverage}"
+    fi
+    printf '%s\n' "$command"
+}
+
+run_flutter_test() {
+    local command
+
+    command="$(flutter_test_command)"
+
+    say 'setup'
+    if ! run_commands setup setup; then
+        status=errored
+        return 0
+    fi
+
+    say 'test'
+    if stack_sandboxed test -- bash -c "$command"; then
+        status=passed
+    else
+        status=failed
+    fi
+
+    collect_report
+    if coverage_wanted; then
+        collect_coverage lcov lcov.info
+    fi
+}
+
+run() {
+    say 'run'
+
+    if [ ! -f "$state/job.json" ] || [ ! -f "$state/stack.json" ]; then
+        say 'prepare has not run in this container'
+        return 1
+    fi
+
+    mode="$(jq -r '.mode' "$state/job.json")"
+    role="$(jq -r '.role' "$state/job.json")"
+    stack="$(jq -r '.stack' "$state/job.json")"
+    shard="$(jq -r '.shard' "$state/job.json")"
+    shards="$(jq -r '.shards' "$state/job.json")"
+    scoped="$(jq -r '.scoped' "$state/job.json")"
+    gateway="$(jq -r '.gateway' "$state/job.json")"
+    php="$(jq -r '.php' "$state/job.json")"
+    filter="$(jq -r '.filter' "$state/job.json")"
+    pint_base="$(jq -r '.pint_base' "$state/job.json")"
+    log_upload="$(jq -r '.log_upload // false' "$state/job.json")"
+    live="$(jq -r '.live // false' "$state/job.json")"
+    prepare_started="$(jq -r '.prepare_started' "$state/job.json")"
+    dir="$(jq -r '.dir' "$state/stack.json")"
+
+    # Live progress starts with the run; report stops it.
+    live_event status run || true
+    live_start || true
+
+    # 1. The cache was restored by root; -h keeps a planted symlink from
+    #    handing uid 2000 the file it points at.
+    ci-sandbox --reap
+    install -d -m 0700 -o "$sandbox_uid" -g "$sandbox_uid" "$out"
+    install -d -m 0700 "$cache/composer" "$cache/npm" "$cache/pub"
+    chown -R -h "$sandbox_uid:$sandbox_uid" "$cache"
+
+    # 2. The environment every manifest command sees (names fixed by the
+    #    manifest contract). The changed-file list is root's copy, read-only.
+    sandbox_env=(
+        CI_REPORT_DIR="$out"
+    )
+    if [ "$role" = test ] || [ "$role" = flutter-test ]; then
+        sandbox_env+=(
+            CI_SHARD="$shard"
+            CI_SHARDS="$shards"
+        )
+    fi
+    if [ "$scoped" = true ]; then
+        sandbox_env+=(
+            CI_SCOPE_PHP="$php"
+            CI_SCOPE_FILTER="$filter"
+        )
+    fi
+    if [ -n "$pint_base" ]; then
+        install -m 0644 "$state/changed-files.log" "$changed_files"
+        sandbox_env+=(
+            CI_CHANGED_FILES="$changed_files"
+        )
+    fi
+    if [ "$stack" = flutter ]; then
+        sandbox_env+=(
+            FLUTTER_SUPPRESS_ANALYTICS=true
+            PUB_CACHE="$cache/pub"
+        )
+    else
+        sandbox_env+=(
+            APP_ENV=testing
+            COMPOSER_CACHE_DIR="$cache/composer"
+            npm_config_cache="$cache/npm"
+        )
+    fi
+
+    # 3. The role's commands, whose outcome becomes the status.
+    write_empty_summary
+    case "$role" in
+        lint) run_lint ;;
+        aux) run_aux ;;
+        warm) run_warm ;;
+        test) run_test ;;
+        flutter-lint) run_flutter_lint ;;
+        flutter-warm) run_flutter_warm ;;
+        flutter-test) run_flutter_test ;;
+        job) run_job ;;
+    esac
+
+    # 4. Kill, then report.
+    say 'report'
+    report
+}
+
+# ---------------------------------------------------------------------------
+# build
+# ---------------------------------------------------------------------------
+
+# usage: ask_token_door <role> <what> <wait-seconds>
+# Posts $state/token-request.json to the token door with a fresh OIDC token each time, the answer in
+# $secret/token.json, until the answer is final; leaves its HTTP status in exchange_code and the server's error
+# code in exchange_reason (empty unless it has the server's shape, so only the server's own words reach the public
+# log). The server answers 503 while the row is not dispatched yet, the head cannot be read or the target is busy,
+# so those and every edge failure are asked again until <wait-seconds> pass (ci-post retries within one token's
+# life). An answer the edge lost on the last try may have been the one that started the row: one more ask turns
+# that into 409 already_used, which lets the role close the row instead of leaving it Running for the server's
+# sweep. Says the wait, the spent wait and a refusal other than 409; a 2xx or a 409 is the role's to read.
+ask_token_door() {
+    local role="$1"
+    local what="$2"
+    local wait_seconds="$3"
+    local deadline=$((SECONDS + wait_seconds))
+    local graced=false
+    local reason_filter='.error.code // "" | select(test("\\A[a-z_]{1,40}\\z"))'
+    local detail
+
+    while :; do
+        oidc_config "$token_audience" "$secret/oidc-token.curl"
+        ci-post "$api/api/ci/token" "$secret/oidc-token.curl" "$secret/token.json" "$state/token-request.json" || true
+        rm -f "$secret/oidc-token.curl"
+
+        exchange_code="$(http_status "$secret/token.json")"
+        exchange_reason="$(jq -r "$reason_filter" "$secret/token.json" 2>/dev/null || true)"
+        detail="HTTP $exchange_code${exchange_reason:+, $exchange_reason}"
+
+        case "$exchange_code" in
+            2?? | 409)
+                return 0
+                ;;
+            000 | 429 | 502 | 503 | 504 | 52[0-4])
+                if [ "$SECONDS" -lt "$deadline" ]; then
+                    say "$role: not ready yet ($detail)"
+                    continue
+                fi
+
+                # A 429 or a 503 is the server saying no, so only a lost answer gets the extra ask.
+                case "$exchange_code" in
+                    000 | 502 | 504 | 52[0-4])
+                        if [ "$graced" = false ]; then
+                            graced=true
+                            continue
+                        fi
+                        ;;
+                esac
+
+                say "$role: no $what within $wait_seconds s ($detail)"
+                return 0
+                ;;
+            *)
+                say "$role: refused ($detail)"
+                return 0
+                ;;
+        esac
+    done
+}
+
+# Trades the job's OIDC token for the build and leaves the answer in $secret/token.json. Sets build_outcome: started,
+# used (the row is Running but its answer never reached this job) or refused; build_started is true for the first
+# two. The server's 409 is final.
+exchange_build() {
+    build_outcome=refused
+    jq -n --arg id "$CI_RUN_ID" '{ci_run_id: $id}' >"$state/token-request.json"
+
+    ask_token_door build answer "$CI_BUILD_WAIT_SECONDS"
+
+    case "$exchange_code" in
+        2??)
+            build_started=true
+            build_outcome=started
+            ;;
+        409)
+            if [ "$exchange_reason" = already_used ]; then
+                build_started=true
+                build_outcome=used
+            else
+                say "build: refused (${exchange_reason:-HTTP 409})"
+            fi
+            ;;
+    esac
+}
+
+# Checks the shape of every value of the build answer before any of it reaches a file, a URL, a curl config or a
+# sandboxed shell, with jq's \A and \z (^ and $ match per line). dir, path and name follow the server's manifest
+# rules; a step is what the manifest allows a `run` to be. Prints the names of the fields that fail.
+build_answer_problems() {
+    jq -r '
+        def text(pattern): type == "string" and test(pattern);
+        def relative_path:
+            text("\\A[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*\\z")
+            and length <= 1024
+            and (split("/") | all(. != "." and . != ".."));
+        def whole(low; high): type == "number" and . == floor and . >= low and . <= high;
+        def step:
+            type == "object"
+            and keys == ["run"]
+            and (.run | type == "string" and test("\\S") and length <= 500 and all(explode[]; . != 0));
+        def proxied: [.features | objects | .git_proxy == true] | any;
+        if type != "object" or (.build | type) != "object" or (.artifact | type) != "object" then "answer"
+        else
+            [
+                (if .kind == "build" and .role == "build" then empty else "role" end),
+                (if (.token | text("\\A[A-Za-z0-9._-]+\\z")) then empty else "token" end),
+                (if (.repository | text("\\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\z")) then empty else "repository" end),
+                (if (.head_sha | text("\\A[0-9a-f]{40}\\z")) then empty else "head_sha" end),
+                (if (.mode | IN("pr", "main")) then empty else "mode" end),
+                (if .features == null or (.features | type == "object" and all(.[]; type == "boolean"))
+                    then empty else "features" end),
+                (if (proxied | not) or (.git_ticket | text("\\Av1\\.[A-Za-z0-9_-]+\\.[0-9a-f]{64}\\z"))
+                    then empty else "git_ticket" end),
+                (if (.build.name | text("\\A[a-z0-9][a-z0-9-]{0,31}\\z")) then empty else "name" end),
+                (if .build.dir == "." or (.build.dir | relative_path) then empty else "dir" end),
+                (if (.build.path | relative_path) then empty else "path" end),
+                (if (.build.steps | type == "array" and length >= 1 and length <= 20 and all(.[]; step))
+                    then empty else "steps" end),
+                (if (.artifact.upload_ticket | text("\\A[A-Za-z0-9._~+/=-]+\\z") and length <= 4096)
+                    then empty else "upload_ticket" end),
+                (if (.artifact.chunk_bytes | whole(1; 4718592)) then empty else "chunk_bytes" end),
+                (if (.artifact.max_bytes | whole(1; 1099511627776)) then empty else "max_bytes" end),
+                (if (.artifact.max_entries | whole(1; 4294967295)) then empty else "max_entries" end),
+                (if (.artifact.expires_at | type == "string") then empty else "expires_at" end)
+            ] | join(",")
+        end
+    ' "$secret/token.json"
+}
+
+# Keeps what run needs of a checked answer in root-only files, because run, a later step, never sees the answer:
+# the steps and the directory in $state/stack.json (the list run_commands reads), the output path, the chunk size,
+# the size cap and prepare's epoch in $secret/build.json, the upload ticket in $secret/artifact-ticket. Every
+# token and ticket goes to $secret/redact before any build output exists.
+store_build_answer() {
+    store_source_token
+    jq -j '.artifact.upload_ticket' "$secret/token.json" >"$secret/artifact-ticket"
+
+    {
+        jq -r '.token, (.git_ticket // empty), .artifact.upload_ticket' "$secret/token.json"
+        basic_auth
+        echo
+    } >"$secret/redact"
+
+    jq '{dir: .build.dir, build: [.build.steps[].run]}' "$secret/token.json" >"$state/stack.json"
+    jq --argjson started "$prepare_started" '{
+        path: .build.path,
+        chunk_bytes: .artifact.chunk_bytes,
+        max_bytes: .artifact.max_bytes,
+        release: .head_sha[0:7],
+        prepare_started: $started,
+    }' "$secret/token.json" >"$secret/build.json"
+
+    mode="$(jq -r '.mode' "$secret/token.json")"
+    head_sha="$(jq -r '.head_sha' "$secret/token.json")"
+    dir="$(jq -r '.build.dir' "$secret/token.json")"
+}
+
+# usage: settle_build <status> <line>   ends the build with <status>; <line> is fixed text for both logs
+settle_build() {
+    status="$1"
+    build_note="$2"
+    say "$2"
+}
+
+# usage: settle_failed_call <line>
+# After a sandboxed call under the build's deadline failed. Out of time (no time was left to start it, or timeout
+# cut it at the ceiling, which only the clock tells apart from the command's own 124 or 137) is errored and reaped
+# at once, because timeout's TERM killed ci-sandbox before its own reap; anything else is the build's own failure.
+settle_failed_call() {
+    if [ "$step_not_started" = true ] \
+        || { { [ "$step_code" = 124 ] || [ "$step_code" = 137 ]; } && [ "$(date +%s)" -ge "$job_deadline" ]; }; then
+        ci-sandbox --reap
+        settle_build errored 'build: out of time'
+    else
+        settle_build failed "$1"
+    fi
+}
+
+# Closes a started build as errored: the source token revoked when it is still held (revoke_token names its own
+# failure on the public log, and the row must be closed whatever it says), then the result.
+abandon_build() {
+    if [ -f "$secret/github.curl" ]; then
+        revoke_token || true
+    fi
+    report_build errored
+}
+
+# usage: fail_build <line>   says <line>, closes the started build as errored and leaves
+fail_build() {
+    say "$1"
+    build_note="$1"
+    abandon_build
+    exit 1
+}
+
+# Writes $state/build-tail.txt: the step logs in order, the pack log and the line that ended the build, redacted
+# with every value in $secret/redact, as at most 32768 bytes of valid UTF-8.
+build_log_tail() {
+    local raw="$state/build-tail.raw"
+    local index=1
+
+    # 1. The build's own output, then the fixed line that ended it.
+    {
+        while [ -f "$state/build-$index.log" ]; do
+            printf '== build-%s ==\n' "$index"
+            cat "$state/build-$index.log"
+            index=$((index + 1))
+        done
+        if [ -f "$state/pack.log" ]; then
+            printf '== pack ==\n'
+            cat "$state/pack.log"
+        fi
+        if [ -n "$build_note" ]; then
+            printf 'ci: %s\n' "$build_note"
+        fi
+    } >"$raw"
+
+    # 2. Cut on a line boundary before the redaction: a value is only matched whole within one line, so the cut
+    #    must never leave the second half of one at the start.
+    if [ "$(wc -c <"$raw")" -gt 131072 ]; then
+        tail -c 131072 "$raw" | LC_ALL=C sed 1d >"$raw.cut"
+        mv "$raw.cut" "$raw"
+    fi
+
+    # 3. The whole text redacted, then its last bytes; mb_scrub turns a character the cut split into `?`, so the
+    #    tail stays valid UTF-8 and never grows. A build that failed before the answer was stored has no values.
+    : >>"$secret/redact"
+    ci-live --redact "$secret/redact" <"$raw" >"$state/build-tail.redacted"
+    php -r 'echo mb_scrub(substr((string) stream_get_contents(STDIN), -32768), "UTF-8");' \
+        <"$state/build-tail.redacted" >"$state/build-tail.txt"
+}
+
+# usage: report_build <status>   posts {ci_run_id, status, log_tail}; exits 1 when it was not delivered
+report_build() {
+    reporting=true
+    rm -f "$secret/artifact-ticket" "$state/artifact.tar.gz"
+
+    # 1. Nothing the build started may be alive once the results token exists.
+    if ! ci-sandbox --reap; then
+        say 'uid 2000 processes survived; results not sent'
+        exit 1
+    fi
+
+    # 2. Only now mint the results token.
+    build_log_tail
+    jq -n --arg id "$CI_RUN_ID" --arg status "$1" --rawfile tail "$state/build-tail.txt" \
+        '{ci_run_id: $id, status: $status, log_tail: $tail}' >"$state/results.json"
+    oidc_config "$results_audience" "$secret/results.curl"
+
+    if ! ci-post "$api/api/ci/results" "$secret/results.curl" "$state/results-response.json" "$state/results.json"; then
+        rm -f "$secret/results.curl"
+        say "results rejected (HTTP $(http_status "$state/results-response.json"))"
+        exit 1
+    fi
+
+    rm -f "$secret/results.curl"
+    say 'results sent'
+}
+
+prepare_build() {
+    # The pool's 20 minute limit started before this step, so the build's ceiling counts from here.
+    prepare_started="$(date +%s)"
+    local problems
+    local token_shape='.token | type == "string" and test("\\A[A-Za-z0-9._-]+\\z")'
+    local nonce
+    local scope
+
+    say 'prepare'
+
+    # 1. Nothing may be running as uid 2000 while the tokens exist.
+    ci-sandbox --reap
+
+    # 2. The build, or the reason there is none. A row that started without this job seeing its answer is closed.
+    exchange_build
+    case "$build_outcome" in
+        started) ;;
+        used) fail_build 'build: the token was issued but its answer never arrived' ;;
+        *)
+            rm -f "$secret/token.json"
+            exit 1
+            ;;
+    esac
+
+    # 3. The answer's shape before any of it is used; only field names reach the public log.
+    #    A token of its own shape is valid until GitHub expires it, so it alone is kept, for the revocation.
+    problems="$(build_answer_problems)"
+    if [ -n "$problems" ]; then
+        if jq -e "$token_shape" "$secret/token.json" >/dev/null 2>&1; then
+            write_github_curl
+        fi
+        rm -f "$secret/token.json"
+        fail_build "build: the answer has an unexpected shape ($problems)"
+    fi
+    store_build_answer
+
+    # 4. The source, then the token is gone.
+    init_checkout "$(jq -r '.repository' "$secret/token.json")"
+    fetch_source
+    revoke_token
+    say "mode=$mode"
+
+    # 5. Root checks the directory before any repository code has run, then hands the tree to uid 2000. -h: a
+    #    symlink in the checkout is re-owned itself, never its target.
+    if ! resolve_dir "$tree" "$dir" >/dev/null; then
+        fail_build 'build: the build directory is not usable'
+    fi
+    rm -rf "$tree/.git"
+    chown -R -h "$sandbox_uid:$sandbox_uid" "$tree"
+
+    # 6. A cache key and a restore scope random per job, so no cache another job seeded is restored into a build
+    #    whose output gets deployed. Nothing is ever saved (the matrix says save: false).
+    nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    scope="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    printf '::add-mask::%s\n' "$nonce" "$scope" >&3
+    printf 'cache_key=build-%s\ncache_scope=build-%s\nmode=%s\n' "$nonce" "$scope" "$mode" >>"${GITHUB_OUTPUT:?}"
+    say 'prepared'
+}
+
+# usage: pack_build <path>
+# Packs <path> under the build directory into root's $state/artifact.tar.gz, or settles the build.
+pack_build() {
+    local workdir
+    local output
+    local archive="$artifact_dir/build.tar.gz"
+
+    # 1. A step may have swapped the directory or the output for a symlink. Nothing runs as uid 2000 now, so what
+    #    resolves here is what pack reads (ci-artifact refuses a link below it on its own).
+    ci-sandbox --reap
+    if ! workdir="$(resolve_dir "$tree" "$dir")" || ! output="$(resolve_dir "$workdir" "$1")"; then
+        settle_build failed 'build: the build output is not a usable directory'
+        return 0
+    fi
+
+    # 2. Packed as uid 2000, which reads the output with the rights that wrote it, into a directory root made.
+    rm -rf "$artifact_dir"
+    mkdir -m 0700 "$artifact_dir"
+    chown "$sandbox_uid:$sandbox_uid" "$artifact_dir"
+    if ! sandboxed pack "$artifact_dir" -- ci-artifact pack "$output" "$archive"; then
+        settle_failed_call 'build: the build output was refused'
+        return 0
+    fi
+
+    # 3. Root's own copy of a regular file with one link: nothing uid 2000 can still touch is uploaded.
+    if [ ! -f "$archive" ] || [ -L "$archive" ] || [ -z "$(find "$archive" -maxdepth 0 -type f -links 1)" ]; then
+        settle_build errored 'build: the archive is missing'
+        return 0
+    fi
+    cp -- "$archive" "$state/artifact.tar.gz"
+    rm -rf "$artifact_dir"
+}
+
+# usage: upload_build <chunk-bytes> <max-bytes>
+# The upload may run until 120 s past the build's ceiling (ci-post can spend 240 s on one chunk), which still
+# leaves the result time to post before the pool's 20 minute limit; with none left it does not start.
+upload_build() {
+    local size
+    local remaining
+    local code=0
+
+    size="$(wc -c <"$state/artifact.tar.gz")"
+    size="${size//[[:space:]]/}"
+    if [ "$size" -gt "$2" ]; then
+        settle_build failed 'build: the artifact is larger than the server allows'
+        return 0
+    fi
+
+    remaining=$((prepare_started + CI_BUILD_CEILING_SECONDS + 120 - $(date +%s)))
+    if [ "$remaining" -lt 1 ]; then
+        settle_build errored 'build: the artifact upload ran out of time'
+        return 0
+    fi
+
+    # ci-artifact reads the ticket from its file and writes its fixed refusal and request log to the root-only logs.
+    say 'build: uploading the artifact'
+    CI_STATE_DIR="$state" timeout --kill-after=15 "$remaining" \
+        ci-artifact upload "$state/artifact.tar.gz" "$api" "$secret/artifact-ticket" "$1" || code=$?
+
+    case "$code" in
+        0) say 'build: artifact sent' ;;
+        124 | 137) settle_build errored 'build: the artifact upload ran out of time' ;;
+        *) settle_build errored 'build: the artifact upload failed' ;;
+    esac
+}
+
+# The answer's steps in order as build-1..build-N, under what is left of CI_BUILD_CEILING_SECONDS since prepare;
+# then the output packed and uploaded, and the result posted whatever happened.
+run_build() {
+    local job_deadline
+    local path
+    local chunk_bytes
+    local max_bytes
+
+    say 'run'
+    build_started=true
+
+    if [ ! -f "$secret/build.json" ] || [ ! -f "$state/stack.json" ]; then
+        fail_build 'prepare has not run in this container'
+    fi
+
+    dir="$(jq -r '.dir' "$state/stack.json")"
+    path="$(jq -r '.path' "$secret/build.json")"
+    chunk_bytes="$(jq -r '.chunk_bytes' "$secret/build.json")"
+    max_bytes="$(jq -r '.max_bytes' "$secret/build.json")"
+    prepare_started="$(jq -r '.prepare_started' "$secret/build.json")"
+
+    # 1. The steps see no variable beyond ci-sandbox's own and CI_RELEASE: a build holds no secret to hand them, and
+    #    its tree has no .git to read the release from. The release is the name the deploy's Sentry upload uses.
+    ci-sandbox --reap
+    sandbox_env=(CI_RELEASE="$(jq -r '.release' "$secret/build.json")")
+
+    # 2. The steps under the deadline sandboxed reads; the first that fails stops them.
+    job_deadline=$((prepare_started + CI_BUILD_CEILING_SECONDS))
+    step_code=0
+    step_not_started=false
+    status=passed
+
+    say 'build'
+    if ! run_commands build build; then
+        settle_failed_call 'build: a step failed'
+    fi
+
+    # 3. Only a build whose steps all passed is packed, and only a packed one uploaded.
+    if [ "$status" = passed ]; then
+        pack_build "$path"
+    fi
+    if [ "$status" = passed ]; then
+        upload_build "$chunk_bytes" "$max_bytes"
+    fi
+    job_deadline=''
+
+    say "build: $status"
+    report_build "$status"
+}
+
+# ---------------------------------------------------------------------------
+# deploy
+# ---------------------------------------------------------------------------
+
+# No network and no repository: this step only gives ci.yml's cache steps a key and a scope that are
+# random per job, so a cache entry another job of this pool account seeded can never be restored into a
+# job that holds a certificate. Nothing is ever saved (the matrix says save: false).
+prepare_deploy() {
+    local nonce
+    local scope
+
+    say 'prepare'
+
+    nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    scope="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+
+    printf '::add-mask::%s\n' "$nonce" "$scope" >&3
+    printf 'cache_key=deploy-%s\ncache_scope=deploy-%s\nmode=main\n' "$nonce" "$scope" >>"${GITHUB_OUTPUT:?}"
+    say 'prepared'
+}
+
+forget_deploy_key() {
+    rm -f "$secret/deploy-key" "$secret/deploy-key.pub" "$secret/deploy-key-cert.pub" "$secret/known_hosts" \
+        "$secret/token.json" "$secret/oidc-token.curl"
+}
+
+# Leaves the tailnet and removes the artifact deploy's run directory, then the key. Safe to run any number of
+# times and from the EXIT trap: ci-reach down works on an `up` that failed at any point or never ran.
+clean_deploy_run() {
+    if [ -n "$deploy_run" ]; then
+        if ! ci-reach down "$deploy_run/reach"; then
+            echo 'deploy: leaving the tailnet failed'
+        fi
+        rm -rf -- "$deploy_run"
+        deploy_run=''
+    fi
+
+    forget_deploy_key
+}
+
+# usage: stop_deploy <exit-status>
+# A signal ends the job: the files go first, then a Running row is closed as errored.
+stop_deploy() {
+    trap - TERM INT HUP
+    clean_deploy_run
+    say 'deploy: stopped by a signal'
+
+    if [ "$reporting" = false ]; then
+        report_deploy errored
+    fi
+
+    exit "$1"
+}
+
+# Trades the job's OIDC token and the ephemeral key's public half for a certificate, and leaves the answer in
+# $secret/token.json. Sets deploy_outcome: certified, skipped (the default branch moved on, final and clean),
+# used (the row is Running but this job never saw the certificate: its answer was lost) or refused. The server's
+# 409 is final.
+exchange_certificate() {
+    deploy_outcome=refused
+
+    jq -n --arg id "$CI_RUN_ID" --arg key "$(awk '{ print $1 " " $2 }' "$secret/deploy-key.pub")" \
+        '{ci_run_id: $id, public_key: $key}' >"$state/token-request.json"
+
+    say 'deploy: asking for a certificate'
+    ask_token_door deploy certificate "$CI_DEPLOY_WAIT_SECONDS"
+
+    case "$exchange_code" in
+        2??)
+            deploy_certified=true
+            deploy_outcome=certified
+            ;;
+        409)
+            case "$exchange_reason" in
+                deploy_skipped)
+                    deploy_outcome=skipped
+                    ;;
+                already_used)
+                    deploy_certified=true
+                    deploy_outcome=used
+                    say 'deploy: the certificate was issued but its answer never arrived'
+                    ;;
+                *)
+                    say "deploy: refused (${exchange_reason:-HTTP 409})"
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+# Checks the shape of every value of the answer before any of it reaches a file or an ssh argument: the host
+# never starts with a dash and nothing holds a newline (jq's \A and \z, not ^ and $, which match per line).
+# Returns the names of the fields that fail. An artifact belongs to kind rsync only, and only there are its
+# secrets (the server's names, 1 to 16384 bytes without NUL, at most 20) and its tailnet key read, the key
+# exactly when reach is tailscale. A missing kind or reach is a command target reached directly; a command target
+# is never reached over a tailnet, because its one ssh call takes no ProxyCommand.
+deploy_answer_problems() {
+    jq -r '
+        def text(pattern): type == "string" and test(pattern);
+        def artifact_ok:
+            (.artifact | type == "object")
+            and (.artifact.sha256 | text("\\A[0-9a-f]{64}\\z"))
+            and (.artifact.size | type == "number" and . >= 1 and . <= 1e15 and . == floor)
+            and (.artifact.download_ticket | text("\\A[A-Za-z0-9._~+/=-]{1,4096}\\z"));
+        def secrets_ok:
+            .secrets == null
+            or ((.secrets | type == "object" and length <= 20)
+                and all(.secrets | to_entries[];
+                    (.key | test("\\A[A-Z][A-Z0-9_]{0,63}\\z"))
+                    and (.value | type == "string" and length > 0 and utf8bytelength <= 16384
+                        and (any(explode[]; . == 0) | not))));
+        def tailscale_ok:
+            (.tailscale | type == "object")
+            and (.tailscale.auth_key | text("\\Atskey-[A-Za-z0-9_-]{1,250}\\z"))
+            and (.tailscale.expires_at | . == null or type == "string");
+        if (type != "object") or ((.target | type) != "object") then "answer"
+        else
+            [
+                (if (.certificate | text("\\Assh-ed25519-cert-v01@openssh\\.com [A-Za-z0-9+/]+={0,3}( [^\\n]{0,200})?\\z")) then empty else "certificate" end),
+                (if (.head_sha | text("\\A[0-9a-f]{40}\\z")) then empty else "head_sha" end),
+                (if (.target.host | text("\\A[A-Za-z0-9:][A-Za-z0-9.:-]{0,252}\\z")) then empty else "host" end),
+                (if (.target.port | type == "number" and . >= 1 and . <= 65535 and . == floor) then empty else "port" end),
+                (if (.target.user | text("\\A[a-z_][a-z0-9_-]{0,31}\\z")) then empty else "user" end),
+                (if (.target.host_key | text("\\A(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+={0,3}\\z")) then empty else "host_key" end),
+                (if .kind == null or .kind == "command" or .kind == "rsync" then empty else "kind" end),
+                (if .reach == null or .reach == "direct" or (.reach == "tailscale" and .kind == "rsync")
+                    then empty else "reach" end),
+                (if .kind == "rsync" then (if artifact_ok then empty else "artifact" end)
+                    elif .artifact == null then empty else "artifact" end),
+                (if .kind != "rsync" or secrets_ok then empty else "secrets" end),
+                (if .kind != "rsync" then empty
+                    elif .reach == "tailscale" then (if tailscale_ok then empty else "tailscale" end)
+                    elif .tailscale == null then empty else "tailscale" end)
+            ] | join(",")
+        end
+    ' "$secret/token.json"
+}
+
+report_deploy() {
+    reporting=true
+    clean_deploy_run
+
+    jq -n --arg id "$CI_RUN_ID" --arg status "$1" --argjson duration "$SECONDS" '{
+        ci_run_id: $id,
+        status: $status,
+        duration_s: $duration,
+        counts: {tests: 0, failures: 0, errors: 0, skipped: 0},
+        failures: [],
+        annotations: [],
+    }' >"$state/results.json"
+
+    oidc_config "$results_audience" "$secret/results.curl"
+
+    if ! ci-post "$api/api/ci/results" "$secret/results.curl" "$state/results-response.json" "$state/results.json"; then
+        rm -f "$secret/results.curl"
+        say "results rejected (HTTP $(http_status "$state/results-response.json"))"
+        exit 1
+    fi
+
+    rm -f "$secret/results.curl"
+    say 'results sent'
+}
+
+# usage: deploy_ssh_settings <host-key-algorithms>
+# Fills deploy_ssh with what every connection to a target is held to: the pinned host key only, the job's
+# certificate only, no agent, no forwarding, no prompt. A command target passes them as -o, an artifact target
+# writes them into its ssh config.
+deploy_ssh_settings() {
+    deploy_ssh=(
+        CertificateFile="$secret/deploy-key-cert.pub"
+        IdentitiesOnly=yes
+        UserKnownHostsFile="$secret/known_hosts"
+        GlobalKnownHostsFile=/dev/null
+        StrictHostKeyChecking=yes
+        UpdateHostKeys=no
+        HostKeyAlgorithms="$1"
+        PreferredAuthentications=publickey
+        BatchMode=yes
+        ConnectTimeout=20
+        ServerAliveInterval=30
+        ServerAliveCountMax=6
+        ClearAllForwardings=yes
+        ForwardAgent=no
+        RequestTTY=no
+        LogLevel=ERROR
+    )
+}
+
+# usage: write_locked <file> <jq-filter>
+# Writes the raw text the filter picks from the answer to a new 0400 file. The value goes from jq to the file
+# only: never an argument, a variable or the environment.
+write_locked() {
+    (umask 0377 && jq -j "$2" "$secret/token.json" >"$1")
+}
+
+# usage: write_deploy_secrets <run-dir> <reach>
+# Each secret of the answer becomes <run-dir>/secrets/<NAME>, the download ticket <run-dir>/ticket and, for reach
+# tailscale, the tailnet key <run-dir>/authkey. deploy_answer_problems held every name to [A-Z][A-Z0-9_]*, so
+# none is a path and each is a jq identifier.
+write_deploy_secrets() {
+    local run="$1"
+    local names
+    local name
+
+    mkdir -m 0700 "$run/secrets"
+    names="$(jq -r '.secrets // {} | keys[]' "$secret/token.json")"
+
+    while IFS= read -r name; do
+        if [ -n "$name" ]; then
+            write_locked "$run/secrets/$name" ".secrets.$name"
+        fi
+    done <<<"$names"
+
+    write_locked "$run/ticket" '.artifact.download_ticket'
+
+    if [ "$2" = tailscale ]; then
+        write_locked "$run/authkey" '.tailscale.auth_key'
+    fi
+}
+
+# usage: write_deploy_ssh_config <file> <host> <login> [<reach-dir>]
+# ci-ship's rsync runs ssh with this file alone. The target is the alias `target`, so the host never reaches an
+# rsync argument (an IPv6 address would need brackets there); a reach directory routes the connection through
+# that tailnet daemon's socket.
+write_deploy_ssh_config() {
+    local setting
+
+    {
+        printf 'Host target\n'
+        printf '    HostName %s\n' "$2"
+        printf '    User %s\n' "$3"
+        printf '    IdentityFile %s\n' "$secret/deploy-key"
+        for setting in "${deploy_ssh[@]}"; do
+            printf '    %s %s\n' "${setting%%=*}" "${setting#*=}"
+        done
+        if [ -n "${4:-}" ]; then
+            printf '    ProxyCommand tailscale --socket=%s/ts.sock nc %%h %%p\n' "$4"
+        fi
+    } >"$1"
+}
+
+# usage: deploy_within_ceiling <command> [arg ...]
+# Runs the command under timeout with the seconds left before CI_DEPLOY_CEILING_SECONDS. With none left it does
+# not start and returns 124, the status of a command timeout stopped.
+deploy_within_ceiling() {
+    local remaining=$((CI_DEPLOY_CEILING_SECONDS - SECONDS))
+
+    if [ "$remaining" -lt 1 ]; then
+        return 124
+    fi
+
+    CI_STATE_DIR="$state" timeout --kill-after=15 "$remaining" "$@"
+}
+
+# usage: ship_artifact <host> <port> <login> <sha>
+# The rsync transport, for an answer deploy_answer_problems passed. The EXIT and signal traps go in before the
+# first secret reaches a file, so every way out (an error, an exit, a signal) leaves the tailnet and removes the run
+# directory; report_deploy cleans first as well, so nothing is on disk while the result is posted. A failing rsync
+# is failed, anything else that stops the deploy is errored.
+ship_artifact() {
+    local host="$1"
+    local port="$2"
+    local login="$3"
+    local sha="$4"
+    local reach
+    local sha256
+    local size
+    local run
+    local reach_dir=''
+    local code=0
+    local result=errored
+
+    reach="$(jq -r '.reach // "direct"' "$secret/token.json")"
+    sha256="$(jq -r '.artifact.sha256' "$secret/token.json")"
+    size="$(jq -r '.artifact.size' "$secret/token.json")"
+
+    # 1. Cleanup is armed before anything secret is written.
+    trap clean_deploy_run EXIT
+    trap 'stop_deploy 143' TERM
+    trap 'stop_deploy 130' INT
+    trap 'stop_deploy 129' HUP
+    deploy_run="$(mktemp -d "${CI_RUN_DIR:-/run}/ci-deploy.XXXXXX")"
+    run="$deploy_run"
+
+    # 2. The values leave the answer for their own files, and the answer leaves the disk.
+    write_deploy_secrets "$run" "$reach"
+    rm -f "$secret/token.json"
+
+    if [ "$reach" = tailscale ]; then
+        reach_dir="$run/reach"
+    fi
+    write_deploy_ssh_config "$run/ssh_config" "$host" "$login" "$reach_dir"
+
+    # 3. Each step runs only after the one before it worked; the maps reach Sentry before the code ships.
+    say 'deploy: fetching the artifact'
+
+    if ! deploy_within_ceiling ci-artifact fetch "$api" "$run/ticket" "$sha256" "$size" "$run/artifact.tar.gz"; then
+        say 'deploy: the artifact could not be fetched'
+    elif ! deploy_within_ceiling ci-artifact unpack "$run/artifact.tar.gz" "$run/tree"; then
+        say 'deploy: the artifact could not be unpacked'
+    elif [ -n "$reach_dir" ] && ! deploy_within_ceiling ci-reach up "$run/authkey" "$reach_dir"; then
+        say 'deploy: the tailnet could not be joined'
+    elif [ -f "$run/secrets/SENTRY_AUTH_TOKEN" ] \
+        && ! deploy_within_ceiling ci-ship sentry "$run/tree" "$run/secrets" "${sha:0:7}"; then
+        say 'deploy: the source maps could not be uploaded'
+    else
+        say 'deploy: shipping'
+        deploy_within_ceiling ci-ship rsync "$run/tree" "$run/ssh_config" target "$port" || code=$?
+
+        # ci-ship exits 1 when rsync failed; 124 or 137 is the ceiling and 2 a refused argument.
+        case "$code" in
+            0) result=passed ;;
+            1) result=failed ;;
+            *) result=errored ;;
+        esac
+    fi
+
+    say "deploy: finished, $result"
+    report_deploy "$result"
+}
+
+run_deploy() {
+    local problems
+    local host
+    local port
+    local login
+    local sha
+    local algorithm
+    local remaining
+    local setting
+    local options=()
+    local code=0
+    local result
+
+    say 'run'
+
+    ssh-keygen -q -t ed25519 -N '' -C '' -f "$secret/deploy-key"
+    exchange_certificate
+
+    case "$deploy_outcome" in
+        certified) ;;
+        skipped)
+            say 'deploy: the branch moved on, nothing to deploy'
+            forget_deploy_key
+            return 0
+            ;;
+        used)
+            # The row is Running and no certificate ever reached this job: close it as errored.
+            report_deploy errored
+            exit 1
+            ;;
+        *)
+            # Refused or out of time before the row started: nothing for the server to close. An ordinary
+            # outcome, so it leaves without the error trap's "internal error" line.
+            forget_deploy_key
+            exit 1
+            ;;
+    esac
+
+    # From here the row is Running: any failure below is reported as errored by the error trap.
+    problems="$(deploy_answer_problems)"
+    if [ -n "$problems" ]; then
+        say "deploy: the answer has an unexpected shape ($problems)"
+        return 1
+    fi
+
+    host="$(jq -r '.target.host' "$secret/token.json")"
+    port="$(jq -r '.target.port' "$secret/token.json")"
+    login="$(jq -r '.target.user' "$secret/token.json")"
+    sha="$(jq -r '.head_sha' "$secret/token.json")"
+    algorithm="$(jq -r '.target.host_key | split(" ")[0]' "$secret/token.json")"
+
+    # The host key the server pinned is the only one this connection trusts. ssh looks a port other than 22 up
+    # as [host]:port.
+    jq -r '
+        (if .target.port == 22 then .target.host else "[\(.target.host)]:\(.target.port)" end)
+        + " " + .target.host_key
+    ' "$secret/token.json" >"$secret/known_hosts"
+    jq -r '.certificate | split(" ")[0:2] | join(" ")' "$secret/token.json" >"$secret/deploy-key-cert.pub"
+
+    # An RSA host key is offered under its SHA-2 signature names.
+    if [ "$algorithm" = ssh-rsa ]; then
+        algorithm=rsa-sha2-512,rsa-sha2-256
+    fi
+
+    deploy_ssh_settings "$algorithm"
+
+    if [ "$(jq -r '.kind // "command"' "$secret/token.json")" = rsync ]; then
+        ship_artifact "$host" "$port" "$login" "$sha"
+        return 0
+    fi
+
+    rm -f "$secret/token.json"
+
+    for setting in "${deploy_ssh[@]}"; do
+        options+=(-o "$setting")
+    done
+
+    say 'deploy: connecting'
+
+    remaining=$((CI_DEPLOY_CEILING_SECONDS - SECONDS))
+    if [ "$remaining" -lt 60 ]; then
+        remaining=60
+    fi
+
+    # The commit is the whole command line; the box's principals file runs its own script and reads it as
+    # SSH_ORIGINAL_COMMAND. Output goes to the root-only log, never the public one.
+    timeout --kill-after=15 "$remaining" ssh -F /dev/null -i "$secret/deploy-key" "${options[@]}" -p "$port" \
+        -- "$login@$host" "$sha" </dev/null || code=$?
+
+    # 255 is ssh's own failure (no route, a refused key, a host key that does not match) and 124 or 137 a
+    # job that ran out of time: the script may never have run. Any other status is the box script's own.
+    case "$code" in
+        0) result=passed ;;
+        124 | 137 | 255) result=errored ;;
+        *) result=failed ;;
+    esac
+
+    say "deploy: finished, $result"
+    report_deploy "$result"
+}
+
+main() {
+    # Root resolves every command from root-owned directories only: the
+    # image's tool directories (the Flutter SDK among them) are uid 2000's
+    # PATH, never root's. Set here, not at file scope, so the test harness
+    # that sources this file keeps its own PATH.
+    export PATH=/opt/ci:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+    phase="${1:-}"
+
+    case "$phase" in
+        prepare | run) ;;
+        *)
+            echo 'usage: ci-job prepare | run' >&2
+            exit 2
+            ;;
+    esac
+
+    # The run id reaches a URL body and the token exchange, so it is checked
+    # before anything touches the network.
+    if ! [[ "${CI_RUN_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        echo 'ci: CI_RUN_ID is not a lowercase UUID' >&2
+        exit 2
+    fi
+
+    if [ -z "${CI_JOB_NAME:-}" ]; then
+        echo 'ci: CI_JOB_NAME is empty' >&2
+        exit 2
+    fi
+
+    # The server and both audiences are the pool's own; there is no default
+    # to fall back on, so a missing one stops the job before the network.
+    local required
+    for required in CI_API CI_TOKEN_AUDIENCE CI_RESULTS_AUDIENCE; do
+        if [ -z "${!required:-}" ]; then
+            echo "ci: $required is not set" >&2
+            exit 2
+        fi
+    done
+
+    umask 077
+    install -d -m 0711 "$root"
+    install -d -m 0700 "$state" "$secret"
+
+    # fd 3 is the public log; stdout and stderr of everything else go private.
+    # ci-sandbox closes fd 3 before it drops privileges.
+    exec 3>&1
+    exec >>"$state/$phase.log" 2>&1
+
+    trap 'on_error "$LINENO"' ERR
+
+    if [ "$CI_JOB_NAME" = deploy ]; then
+        deploying=true
+        "${phase}_deploy"
+    elif [ "$CI_JOB_NAME" = build ]; then
+        building=true
+        "${phase}_build"
+    else
+        "$phase"
+    fi
+}
+
+# Sourced by scripts/test/ci-job.test.sh for its pure helpers; run otherwise.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi
