@@ -10,9 +10,12 @@
 #
 # 1. Root writes the hand-off: {{dir}}, the answer's dir (one directory under
 #    /tmp, replaced if it exists; 0700, uid 2000) with each dir_files
-#    entry as a 0600 uid 2000 file, the plugin_files under {{plugin}} and the
-#    bundle under its own directory, both root-owned and only readable to
-#    uid 2000, so what was verified cannot be rewritten by the agent.
+#    entry as a 0600 uid 2000 file, the plugin_files under {{plugin}}, the
+#    answer's plugin_dir (/opt/<segment>/plugins/<segment>, replaced if it
+#    exists: the daemon takes a plugin dir only under its own plugin root, so
+#    the server names the path) and the bundle under its own directory, all
+#    root-owned and only readable to uid 2000, so what was verified cannot be
+#    rewritten by the agent.
 # 2. The npm bundle is downloaded and its sha512 compared with
 #    bundle.integrity before a byte of it is unpacked.
 # 3. The review tree is a plain clone of source.sha at source.ref in cwd,
@@ -41,6 +44,7 @@ set -euo pipefail
 agent_root=/run/ci-agent
 git_base=https://github.com
 review_root=/workspace/.reviews
+plugin_root=/opt
 sandbox_uid=2000
 
 # The server's review tree: everything, minus the root .claude folder (its
@@ -104,7 +108,7 @@ agent_finish() {
     if ! ci-sandbox --reap; then
         code=1
     fi
-    rm -rf "$handoff_dir" "$state/agent-git.config" "$state/agent-revoke.curl" "$state/agent-bundle.tgz"
+    rm -rf "$handoff_dir" "$plugin_dir" "$state/agent-git.config" "$state/agent-revoke.curl" "$state/agent-bundle.tgz"
 
     case "$code" in
         0) word='done' ;;
@@ -141,9 +145,10 @@ write_handoff() {
     local name
     local path
 
-    rm -rf "$agent_root" "$handoff_dir"
+    rm -rf "$agent_root" "$handoff_dir" "$plugin_dir"
     install -d -m 0711 "$agent_root"
     install -d -m 0700 "$handoff_dir"
+    (umask 022 && mkdir -p "${plugin_dir%/*}")
     install -d -m 0755 "$plugin_dir" "$spec_dir" "$bundle_dir"
 
     # 1. The credential files. The directory goes to uid 2000 last, so the
@@ -356,7 +361,6 @@ run_sandboxed() {
 agent_run() {
     answer="$1"
     state="$2"
-    plugin_dir="$agent_root/plugin"
     spec_dir="$agent_root/spec"
     bundle_dir="$agent_root/bundle"
 
@@ -370,6 +374,17 @@ agent_run() {
     if ! [[ "$handoff_dir" =~ ^/tmp/[A-Za-z0-9._-]+$ ]] \
         || [ "$handoff_dir" = /tmp/. ] || [ "$handoff_dir" = /tmp/.. ]; then
         echo 'ci-agent: the hand-off dir is not one directory under /tmp'
+        printf 'ci: agent failed\n' >&3
+        exit 1
+    fi
+
+    # The daemon takes a plugin dir only under its own plugin root, so the server names it, and root replaces it:
+    # /opt/<segment>/plugins/<segment> and nothing else, checked the same way.
+    plugin_dir="$(answer_field '.plugin_dir')"
+    local plugin="${plugin_dir#"$plugin_root"/}"
+    if [ "$plugin" = "$plugin_dir" ] || ! [[ "$plugin" =~ ^[A-Za-z0-9._-]+/plugins/[A-Za-z0-9._-]+$ ]] \
+        || [[ "/$plugin/" =~ /\.\.?/ ]]; then
+        echo 'ci-agent: the plugin dir is not one directory under a plugins root'
         printf 'ci: agent failed\n' >&3
         exit 1
     fi

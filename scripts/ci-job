@@ -3201,8 +3201,10 @@ exchange_agent() {
 
 # Checks the shape of the agent answer before any of it is kept, with jq's \A and \z (^ and $ match per line): the
 # working directory is /workspace/.reviews/<pr>/<slug> (root creates and chowns it), the hand-off dir is one segment
-# under /tmp, a file name one segment, none of them `.` or `..`; a plugin path is what the server's plugin writer
-# takes, any relative path without an empty, `.` or `..` segment, a control character or a backslash; the bundle
+# under /tmp, the plugin dir is one segment under a `plugins` directory one segment under /opt (the daemon takes a
+# plugin dir only under its own root, so the server names it), a file name one segment, none of them `.` or `..`;
+# a plugin path is what the server's plugin writer takes, any relative path without an empty, `.` or `..` segment,
+# a control character or a backslash; the bundle
 # names a sha512 integrity; start and prompt are argument lists; the source is a plain owner/repo, a token, a
 # pull request ref, a 40 hex sha and a git ticket or null, since the repository, ticket and ref reach a git config
 # root reads and a newline there would start a new key. Everything else is ci-agent's to read. Prints the names of
@@ -3229,6 +3231,8 @@ agent_answer_problems() {
                 (if (.cwd | text("\\A/workspace/\\.reviews/") and (.[20:] | split("/") | length == 2 and all(segment)))
                     then empty else "cwd" end),
                 (if (.dir | text("\\A/tmp/") and (.[5:] | segment)) then empty else "dir" end),
+                (if (.plugin_dir | text("\\A/opt/[^/]+/plugins/[^/]+\\z") and (.[5:] | split("/") | all(segment)))
+                    then empty else "plugin_dir" end),
                 (if (.bundle.integrity | text("\\Asha512-[A-Za-z0-9+/]+={0,2}\\z")) then empty else "integrity" end),
                 (if (.start | argv) then empty else "start" end),
                 (if (.prompt | argv) then empty else "prompt" end),
