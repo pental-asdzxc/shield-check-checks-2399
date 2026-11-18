@@ -3337,6 +3337,7 @@ run_agent() {
     local answer="$state/agent/answer.json"
     local code=0
     local result
+    local step
 
     say 'run'
     agent_started=true
@@ -3360,13 +3361,19 @@ run_agent() {
     #    refused, 12 on a refused bundle and 13 on a failed clone. Only 10 is errored: the server reads errored as
     #    "the review ran out of time, do not retry", and any other end, whatever kept the agent from running,
     #    is failed so the review starts again on Docker.
+    #    The public line names the step that ended it in a fixed word (never ci-agent's own output), since the
+    #    private logs die with the container.
+    step=''
     case "$code" in
         0) result=passed ;;
         10) result=errored ;;
-        *) result=failed ;;
+        11) result=failed step=' (start)' ;;
+        12) result=failed step=' (bundle)' ;;
+        13) result=failed step=' (clone)' ;;
+        *) result=failed step=' (error)' ;;
     esac
 
-    say "agent: finished, $result"
+    say "agent: finished, $result$step"
     report_agent "$result"
 }
 
