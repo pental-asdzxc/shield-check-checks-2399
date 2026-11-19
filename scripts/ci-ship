@@ -5,7 +5,8 @@
 #        ci-ship sentry <dir> <secrets-dir> <release>
 #
 # rsync   Sends <dir>/ to the target's `./` in two passes. Pass 1 carries
-#         everything except /version.json and the source maps, deletes late
+#         everything except /version.json, the source maps and the box's
+#         /.well-known/acme-challenge directory, deletes late
 #         (--delete-delay) and moves files into place only when the whole
 #         pass has arrived (--delay-updates). Pass 2 sends version.json alone,
 #         when the file exists, so whatever compares itself with that file
@@ -13,13 +14,19 @@
 #         excluded files are also exempt from deletion, which is why
 #         --delete-excluded and -a are never passed: the former would delete
 #         them on the box, the latter would carry owners, links and devices.
+#         The challenge directory belongs to the box's certificate renewal,
+#         which writes there while a build is shipping; the rest of
+#         /.well-known stays shippable, so a build may carry files into it.
 #         Modes are forced to 644 and 755 and owners are left to the target.
 #         ssh runs with <ssh-config> (-F), BatchMode and <port>; <host> must
 #         be a bare host name or address and <ssh-config> a file whose path
 #         holds no whitespace (rsync splits its -e string on it).
 # sentry  Creates release <release> (seven lowercase hex digits) and uploads
-#         <dir> with sentry-cli: the maps plus the scripts they belong to, the
-#         way the manual flow does, instead of a maps-only filter. Every
+#         <dir> with sentry-cli under that release and the same dist: the maps
+#         plus the scripts they belong to, the way the manual flow does,
+#         instead of a maps-only filter. An app that names its dist after its
+#         release (`options.dist`) only matches maps uploaded under it, since
+#         the lookup compares the dist exactly. Every
 #         SENTRY_* file in <secrets-dir> becomes an environment variable of
 #         sentry-cli only, set with `export` inside a subshell so the values
 #         never sit in an argv. Skipped, exit 0, when the SENTRY_AUTH_TOKEN
@@ -61,10 +68,12 @@ ship_rsync() {
 
     local ssh_command="ssh -F $config -o BatchMode=yes -p $port"
 
-    # 2. The bulk of the tree. The version marker and the maps stay out, and --delete-excluded stays off, so
-    #    the box's own copy of the marker survives until pass 2.
+    # 2. The bulk of the tree. The version marker, the maps and the box's ACME challenge directory stay out, and
+    #    --delete-excluded stays off, so the box's own copy of the marker survives until pass 2 and a challenge file a
+    #    certificate renewal wrote mid-deploy is not deleted. rsync then keeps the box's /.well-known directory when the
+    #    build ships none and only logs "cannot delete non-empty directory"; that is not an error, so the exit stays 0.
     rsync -rt --perms --chmod=D755,F644 --no-owner --no-group --delete-delay --delay-updates \
-        --exclude=/version.json '--exclude=*.map' \
+        --exclude=/version.json '--exclude=*.map' --exclude=/.well-known/acme-challenge \
         -e "$ssh_command" "$dir/" "$host:./" >>"$log" 2>&1 || fail 'ship failed: tree'
 
     # 3. The marker goes last: it tells a reader that the files it names are all in place.
@@ -98,7 +107,7 @@ ship_sentry() {
         done
 
         sentry-cli releases new "$release" >>"$log" 2>&1 || exit 1
-        sentry-cli sourcemaps upload --release "$release" "$dir" >>"$log" 2>&1 || exit 1
+        sentry-cli sourcemaps upload --release "$release" --dist "$release" "$dir" >>"$log" 2>&1 || exit 1
     ) || fail 'ship failed: sentry upload'
 }
 
