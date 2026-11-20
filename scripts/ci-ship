@@ -18,6 +18,9 @@
 #         which writes there while a build is shipping; the rest of
 #         /.well-known stays shippable, so a build may carry files into it.
 #         Modes are forced to 644 and 755 and owners are left to the target.
+#         A tree with no regular file to ship besides version.json, the maps
+#         and the challenge directory is refused before any tool runs: pass 1
+#         deletes what the tree does not hold, so it would empty the target.
 #         ssh runs with <ssh-config> (-F), BatchMode and <port>; <host> must
 #         be a bare host name or address and <ssh-config> a file whose path
 #         holds no whitespace (rsync splits its -e string on it).
@@ -65,6 +68,11 @@ ship_rsync() {
     [[ "$port" =~ ^[0-9]{1,5}$ ]] || refuse 'ship refused: bad port'
     [[ -d "$dir" ]] || refuse 'ship refused: no build directory'
     [[ -f "$config" && "$config" != *[[:space:]]* ]] || refuse 'ship refused: bad ssh config'
+    # Pass 1 deletes what the tree does not hold, so a tree with nothing to ship would empty the target. What it
+    # does not ship is what it excludes: the version marker, the maps and the challenge directory.
+    [[ -n "$(find "$dir" -type f ! -name '*.map' ! -path "$dir/version.json" \
+        ! -path "$dir/.well-known/acme-challenge/*" -print -quit)" ]] ||
+        refuse 'ship refused: nothing to ship'
 
     local ssh_command="ssh -F $config -o BatchMode=yes -p $port"
 
